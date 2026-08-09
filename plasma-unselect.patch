@@ -1,0 +1,16 @@
+diff --git a/containments/desktop/package/contents/ui/FolderView.qml b/containments/desktop/package/contents/ui/FolderView.qml
+index 47d2ad9a2..9c6bade17 100644
+--- a/containments/desktop/package/contents/ui/FolderView.qml
++++ b/containments/desktop/package/contents/ui/FolderView.qml
+@@ -447,6 +447,11 @@ FocusScope {
+                         main.doCd(positioner.map(gridView.currentIndex));
+                     } else {
+                         dir.run(positioner.map(gridView.currentIndex));
++                        Qt.callLater(() => {
++                            dir.clearSelection();
++                            gridView.currentIndex = -1;
++                            main.previouslySelectedItemIndex = -1;
++                        });
+                     }
+                     main.previouslySelectedItemIndex = gridView.currentIndex;
+                     hoveredItem = null;

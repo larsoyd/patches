@@ -1,0 +1,14 @@
+diff --git a/applets/kickoff/Footer.qml b/applets/kickoff/Footer.qml
+index 44d0e85d0..d9fb90507 100644
+--- a/applets/kickoff/Footer.qml
++++ b/applets/kickoff/Footer.qml
+@@ -153,7 +153,8 @@ PlasmaExtras.PlasmoidHeading {
+ 
+         anchors {
+             top: parent.top
+-            right: parent.right
++            left: tabBar.right
++            leftMargin: root.spacing
+             bottom: parent.bottom
+         }
+ 
