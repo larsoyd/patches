@@ -1,4 +1,12 @@
-I had been chasing an intermittent KDE Plasma Wayland bug where taskbar window previews would sometimes stop working and PipeWire would report errors like `no more input formats`. What made it especially annoying was that it could disappear after a logout, reboot, or Plasma restart, which made it look like some vague NVIDIA, PipeWire, KWin, or Wayland instability.
+TL;DR: KDE Plasma task thumbnails would randomly stop working. I found out that KPipeWire was trying to serialize a variable-sized list of video capabilities into a fixed 4096-byte buffer but on  my system, the complete list required about 4896 bytes. The randomness came from how   those capabilities were being stored, which was by using a QHash. Because a QHash does not have a fixed order, their iteration order could change with Plasma's process hash seed. Meaning exactly two formats were always being lost, but which two changed from one Plasma process to another. 
+
+So To fix this my patch simply raises the buffer by 3 times to 16384.
+
+
+---
+
+
+TL: I had been chasing an intermittent KDE Plasma Wayland bug where taskbar window previews would sometimes stop working and PipeWire would report errors like `no more input formats`. What made it especially annoying was that it could disappear after a logout, reboot, or Plasma restart, which made it look like some vague NVIDIA, PipeWire, KWin, or Wayland instability.
 
 I started by ruling out the obvious things. The NVIDIA kernel module and userspace versions matched, PipeWire and WirePlumber were healthy, the portal setup looked normal, and there were no matching kernel-side NVIDIA, DRM, DMA-BUF, or GPU errors when the thumbnail failure happened. I also confirmed that ordinary screen recording still worked, which was a useful clue because it meant this was not a general KWin-to-PipeWire capture failure. The problem seemed much narrower, specifically around the Plasma Task Manager thumbnail path using KPipeWire.
 
