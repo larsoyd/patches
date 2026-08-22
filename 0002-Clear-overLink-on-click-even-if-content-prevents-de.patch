@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lars <bumbleberrycar@gmail.com>
+Date: Fri, 21 Aug 2026 22:00:00 +0200
+Subject: [PATCH] Clear overLink on click even if content prevents default
+
+The link-target status panel (bottom-left overlink display) can get
+stuck showing a stale URL indefinitely. This reproduces on sites that
+intercept a click on a hovered link to perform client-side/SPA
+navigation (e.g. YouTube search-result thumbnails): the site calls
+event.preventDefault() and mutates the DOM instead of letting the load
+proceed, and the hovered link's normal mouseout/blur transition -
+which would otherwise clear XULBrowserWindow.overLink - never fires.
+
+This matches the still-open, unfixed upstream reports of a hovered
+link's status-bar/tooltip state surviving a DOM change that never
+dispatches a real pointer-leave transition on the hovered node:
+
+- https://bugzilla.mozilla.org/show_bug.cgi?id=1801077
+  "StatusPanel gets stuck open in an overLink state on some sites,
+  like Twitter"
+- https://bugzilla.mozilla.org/show_bug.cgi?id=1816207
+  "anchor tooltip stays when parent of anchor is removed from
+  document" (Core DOM; 1828952 was deduped onto this one)
+
+XULBrowserWindow.onLocationChange (browser/base/content/browser.js)
+already unconditionally clears overLink for any top-level navigation,
+including same-document SPA transitions, and normally masks this.
+But that clear can be bypassed or raced by sites that intercept the
+click without a location change happening in time, leaving overLink
+displaying whatever was hovered right before the click.
+
+ClickHandlerChild.sys.mjs's handleClickEvent() is the actual parent
+process click-forwarding path for content-area clicks. It already
+bails out on `event.defaultPrevented` before doing anything else,
+which means content that calls preventDefault() on the click (as
+single-page-app routers commonly do) never reaches the parent through
+this path at all. Note that browser.js also defines a same-named
+top-level `contentAreaClick(event, isPanelClick)` function, but it is
+dead code in this actor-based build: it is not registered as an event
+listener anywhere and is never invoked, so patching it would have no
+effect on this bug.
+
+Send a small, unconditional notification to the parent for every
+trusted primary-button click, before the defaultPrevented check, and
+have the parent clear overLink (reusing the same
+setOverLink("", { hideStatusPanelImmediately: true }) call already
+used by onLocationChange and onEnterDOMFullscreen) if it is set. This
+mirrors the existing clearing semantics used elsewhere in the tree and
+does not depend on whether content ends up preventing the default
+action.
+
+As with any click-time clear, this can hide the status panel for a
+moment if a click on a link runs a non-navigating JS handler while the
+pointer keeps hovering that same link; this is a minor, self-
+correcting quirk (any subsequent pointer movement redisplays it) that
+is preferable to the status panel getting stuck indefinitely.
+---
+ browser/actors/ClickHandlerChild.sys.mjs                | 9 +++++++++
+ browser/actors/ClickHandlerParent.sys.mjs                | 10 ++++++++++
+ .../tabbrowser/test/browser/statuspanel/browser.toml      | 2 ++
+ .../statuspanel/browser_overlink_spa_click.js             | 55 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 76 insertions(+)
+ create mode 100644 browser/components/tabbrowser/test/browser/statuspanel/browser_overlink_spa_click.js
+
+diff --git a/browser/actors/ClickHandlerChild.sys.mjs b/browser/actors/ClickHandlerChild.sys.mjs
+--- a/browser/actors/ClickHandlerChild.sys.mjs
++++ b/browser/actors/ClickHandlerChild.sys.mjs
+@@ -53,6 +53,15 @@ export class ClickHandlerChild extends JSWindowActorChild {
+   }
+
+   handleClickEvent(event, isFromMiddleMousePasteHandler = false) {
++    // Clear the link-target status panel for trusted primary-button clicks
++    // even if content calls preventDefault() (e.g. single-page-app routers).
++    // Otherwise a link hovered right before such a click can leave
++    // XULBrowserWindow.overLink stuck indefinitely, since the resulting
++    // DOM/URL change often never fires the mouseout that would clear it.
++    if (event.isTrusted && event.button == 0) {
++      this.sendAsyncMessage("Link:ClearOverLinkOnClick");
++    }
++
+     if (event.defaultPrevented || event.button == 2) {
+       return;
+     }
+diff --git a/browser/actors/ClickHandlerParent.sys.mjs b/browser/actors/ClickHandlerParent.sys.mjs
+--- a/browser/actors/ClickHandlerParent.sys.mjs
++++ b/browser/actors/ClickHandlerParent.sys.mjs
+@@ -59,6 +59,16 @@ export class ClickHandlerParent extends JSWindowActorParent {
+         this.contentAreaClick(message.data);
+         this.notifyClickListeners(message.data);
+         break;
++      case "Link:ClearOverLinkOnClick": {
++        let browser = this.manager.browsingContext.top.embedderElement;
++        let window = browser?.documentGlobal;
++        if (window?.XULBrowserWindow?.overLink) {
++          window.XULBrowserWindow.setOverLink("", {
++            hideStatusPanelImmediately: true,
++          });
++        }
++        break;
++      }
+     }
+   }
+
+diff --git a/browser/components/tabbrowser/test/browser/statuspanel/browser.toml b/browser/components/tabbrowser/test/browser/statuspanel/browser.toml
+--- a/browser/components/tabbrowser/test/browser/statuspanel/browser.toml
++++ b/browser/components/tabbrowser/test/browser/statuspanel/browser.toml
+@@ -1,6 +1,8 @@
+ [DEFAULT]
+ support-files = ["head.js"]
+
++["browser_overlink_spa_click.js"]
++
+ ["browser_show_statuspanel_idn.js"]
+
+ ["browser_show_statuspanel_splitview.js"]
+diff --git a/browser/components/tabbrowser/test/browser/statuspanel/browser_overlink_spa_click.js b/browser/components/tabbrowser/test/browser/statuspanel/browser_overlink_spa_click.js
+new file mode 100644
+--- /dev/null
++++ b/browser/components/tabbrowser/test/browser/statuspanel/browser_overlink_spa_click.js
+@@ -0,0 +1,55 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// eslint-disable-next-line @microsoft/sdl/no-insecure-url
++const SPA_TARGET_URL = "http://example.com/watch";
++
++const SPA_PAGE_URL = encodeURI(
++  `data:text/html,<a id="t" href="${SPA_TARGET_URL}">link</a><script>
++    document.getElementById("t").addEventListener("click", function (e) {
++      e.preventDefault();
++      this.remove();
++    });
++  </script>`
++);
++
++/**
++ * Test that the link-target status panel doesn't get stuck showing a
++ * hovered link's URL when a click on that link is intercepted by content
++ * (e.g. a single-page-app router) and the link is removed from the DOM as
++ * part of handling the click, without ever dispatching a mouseout/blur on
++ * it (bug 1801077).
++ */
++add_task(async function test_overlink_cleared_after_spa_style_click() {
++  let tab = await BrowserTestUtils.openNewForegroundTab(
++    gBrowser,
++    SPA_PAGE_URL
++  );
++  let browser = tab.linkedBrowser;
++
++  let shown = promiseStatusPanelShown(window, SPA_TARGET_URL);
++  await SpecialPowers.spawn(browser, [], async () => {
++    content.document.getElementById("t").focus();
++  });
++  await shown;
++
++  is(
++    window.XULBrowserWindow.overLink,
++    SPA_TARGET_URL,
++    "overLink is set to the hovered link before the click"
++  );
++
++  let hidden = promiseStatusPanelHidden(window);
++  await BrowserTestUtils.synthesizeMouseAtCenter("#t", {}, browser);
++  await hidden;
++
++  is(
++    window.XULBrowserWindow.overLink,
++    "",
++    "overLink should be cleared after a click that removes the hovered link"
++  );
++
++  BrowserTestUtils.removeTab(tab);
++});

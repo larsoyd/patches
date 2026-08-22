@@ -1,0 +1,13 @@
+diff --git a/lutris/__init__.py b/lutris/__init__.py
+index 4d81335b1..aca41cb31 100644
+--- a/lutris/__init__.py
++++ b/lutris/__init__.py
+@@ -1,3 +1,8 @@
+ """Main Lutris package"""
+ 
+ __version__ = "0.5.22"
++
++import gi
++
++gi.require_version("Gtk", "3.0")
++gi.require_version("Gdk", "3.0")
