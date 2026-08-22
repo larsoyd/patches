@@ -1,0 +1,20 @@
+--- a/src/pipewiresourcestream.cpp
++++ b/src/pipewiresourcestream.cpp
+@@ -244,7 +244,7 @@
+ void PipeWireSourceStream::onRenegotiate(void *data, uint64_t)
+ {
+     PipeWireSourceStream *pw = static_cast<PipeWireSourceStream *>(data);
+-    uint8_t buffer[4096];
++    uint8_t buffer[16384];
+     spa_pod_builder podBuilder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+     auto params = pw->createFormatsParams(podBuilder);
+     pw_stream_update_params(pw->d->pwStream, params.data(), params.size());
+@@ -560,7 +560,7 @@
+ 
+     m_renegotiateEvent = pw_loop_add_event(pwCore->loop(), q->onRenegotiate, q);
+ 
+-    uint8_t buffer[4096];
++    uint8_t buffer[16384];
+     spa_pod_builder podBuilder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+     auto params = q->createFormatsParams(podBuilder);
+     pw_stream_flags s = (pw_stream_flags)(PW_STREAM_FLAG_DONT_RECONNECT | PW_STREAM_FLAG_AUTOCONNECT);
