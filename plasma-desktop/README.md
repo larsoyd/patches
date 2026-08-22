@@ -17,10 +17,17 @@ launched. The deferred reset avoids leaving the launched desktop item selected.
 
 ### `plasma-taskmanager-hover-scroll.patch`
 
-Scrolls an overflowing, single-line Task Manager label while its task is
-hovered, then returns it to the beginning. The shared scrolling wrapper gains
-configurable delays, animated return behavior, and content-change handling
-without taking over the task's existing hover or click handling.
+After a task has been hovered for 300 ms, scrolls an overflowing, single-line
+Task Manager label to reveal its end. It pauses there for 500 ms, then animates
+back to the beginning even if the pointer remains over the task; leaving the
+task also starts the return immediately. Title or available-width changes
+reset the label and rearm scrolling when appropriate.
+
+The patch extends the shared scrolling wrapper with an external hover source,
+configurable timing, automatic and animated return, and content-change
+handling. These behaviors are opt-in so its existing Player Controller use
+keeps the original behavior, while the Task Manager disables the wrapper's
+own mouse handling to preserve the task's click and preview-hover handling.
 
 ## Applying
 
