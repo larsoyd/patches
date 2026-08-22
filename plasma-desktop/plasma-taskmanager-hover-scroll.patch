@@ -1,0 +1,372 @@
+diff --git a/applets/taskmanager/qml/ScrollableTextWrapper.qml b/applets/taskmanager/qml/ScrollableTextWrapper.qml
+--- a/applets/taskmanager/qml/ScrollableTextWrapper.qml
++++ b/applets/taskmanager/qml/ScrollableTextWrapper.qml
+@@ -13,31 +13,204 @@
+ 
+     required property Text textItem
+ 
++    // Externally overridable hover source: defaults to this item's own
++    // hover detection (used as-is by PlayerController's MPRIS labels), but
++    // callers such as Task.qml can bind this to a different hover signal
++    // (e.g. task.containsMouse) instead of stacking another MouseArea.
++    property bool hovered: containsMouse
++
++    // When a caller overrides `hovered` above, this MouseArea's own
++    // input/hover handling is not just unused but actively unwanted: it
++    // would still participate in Qt Quick's hover-event distribution as a
++    // live hover-enabled item sitting inside an ancestor that has its own
++    // hover-driven behavior (Task.qml's ToolTipArea, which shows/hides the
++    // window preview based on its own containsMouse). Callers providing
++    // their own hover signal should set this to false to remove this
++    // MouseArea from hover handling entirely, rather than leaving a
++    // redundant, ownerless hover tracker in the tree. Defaults true so
++    // PlayerController's self-detected-hover usage is unaffected.
++    property bool selfDetectHover: true
++
++    property int startDelay: 500
++    property int endDelay: 0
++    property bool autoReturn: false
++    property real forwardMsPerPixel: 25
++    property real returnMsPerPixel: 6
++    property int minReturnDuration: 120
++    property int maxReturnDuration: 450
++
++    // Opt-in behaviors, both defaulting to false so an unmodified caller
++    // (PlayerController's MPRIS labels) gets byte-identical behavior to the
++    // original component: an instant, unanimated snap back to x=0 on leave,
++    // and no reaction to content/width changes beyond the live property
++    // bindings already in the states below. Task.qml opts into both.
++    property bool animatedReturn: false
++    property bool resetOnContentChange: false
++
++    // How far left the text needs to travel to reveal its hidden end,
++    // captured ONCE when the reveal is triggered rather than recomputed
++    // live from width/implicitWidth throughout the "ShowRight" state.
++    // Toggling `elide` (Text.ElideRight -> Text.ElideNone, which the
++    // caller does in lockstep with this state, e.g. Task.qml's
++    // `elide: labelScroller.state ? ...`) can trigger a transient Text
++    // layout recalculation at the exact same instant the state changes;
++    // if the "ShowRight" target were a live binding off implicitWidth, it
++    // would briefly re-evaluate against that transient value and visibly
++    // flash to a wrong position for a frame before settling - freezing it
++    // here removes that whole class of glitch.
++    property real revealOffset: 0
++
++    // Set while state has just been reset to "" by a content/width change
++    // (as opposed to by hover leaving), so the initial delay is only
++    // re-armed once the return-to-start animation has actually finished,
++    // instead of racing it and yanking the text forward again mid-return.
++    property bool pendingRearm: false
++
++    // True for the whole time the un-truncated string needs to stay
++    // rendered and clipped: during the forward reveal AND, when
++    // animatedReturn is on, all the way through the return animation too -
++    // not just while state === "ShowRight". Without this, a caller whose
++    // `elide` binding follows `state` directly flips back to Text.ElideRight
++    // (and clip back to false) the instant the return starts, while the
++    // text is still animating back from a large negative x: the now-short
++    // elided string briefly renders unclipped, offset toward the icon.
++    // With animatedReturn false, x snaps to 0 in the same tick state
++    // changes, so this collapses to the original `state === "ShowRight"`
++    // behavior exactly - no observable change for that (e.g. MPRIS) path.
++    readonly property bool revealActive:
++        state === "ShowRight" || (animatedReturn && textItem.x !== 0)
++
++    function resetForContentChange() {
++        if (root.state !== "") {
++            root.state = "";
++            root.pendingRearm = root.hovered;
++        } else if (root.hovered) {
++            startTimer.restart();
++        }
++    }
++
+     onTextItemChanged: {
+         textItem.parent = this;
+         textItem.width = Qt.binding(() => width);
+     }
+ 
+-    clip: textItem.elide === Text.ElideNone
+-    hoverEnabled: true
++    onWidthChanged: {
++        if (root.resetOnContentChange) {
++            resetForContentChange();
++        }
++    }
++
++    // Deliberately does NOT also watch implicitWidth: this component's own
++    // elide/wrapMode toggling (driven by revealActive, in the caller) can
++    // itself perturb a Text item's derived implicitWidth as a side effect
++    // of the layout mode changing, not because anything externally
++    // meaningful changed. Reacting to that risked the component
++    // interpreting its own state transitions as external content changes
++    // and re-arming/resetting itself. onWidthChanged (viewport resize) and
++    // onTextChanged (title change) already cover the cases that actually
++    // matter.
++    Connections {
++        target: root.textItem
++        enabled: root.resetOnContentChange
++        function onTextChanged() { root.resetForContentChange(); }
++    }
+ 
+-    onContainsMouseChanged: {
+-        if (!containsMouse) {
++    clip: revealActive
++    // enabled: false (when a caller supplies its own hover signal) removes
++    // this MouseArea from Qt Quick's input/hover handling entirely, not
++    // just its click handling - see selfDetectHover above.
++    enabled: selfDetectHover
++    hoverEnabled: selfDetectHover
++    // Hardening for the selfDetectHover:true (MPRIS) case: stops this
++    // MouseArea from ever intercepting clicks, while hoverEnabled keeps
++    // hover detection working. MPRIS's own MouseArea previously defaulted
++    // acceptedButtons to Qt.LeftButton; there is no click handling on
++    // those labels today, so this is not expected to be observable, but it
++    // is a real (if inert) change to that caller's input routing, not
++    // identical behavior.
++    acceptedButtons: Qt.NoButton
++
++    onHoveredChanged: {
++        if (hovered) {
++            startTimer.restart();
++        } else {
++            startTimer.stop();
++            endTimer.stop();
++            pendingRearm = false;
+             state = "";
+         }
+     }
+ 
+     Timer {
+-        id: timer
+-        interval: 500
+-        running: root.containsMouse
++        id: startTimer
++        interval: root.startDelay
++        repeat: false
+         onTriggered: {
+-            if (root.width < root.textItem.implicitWidth) {
++            // lineCount is checked here, once, rather than folded into the
++            // continuously-evaluated `hovered` property: a caller
++            // combining hovered with a layout-derived condition like
++            // "lineCount === 1" risks that condition flickering mid-
++            // animation (elide/width changes during the reveal can jitter
++            // layout-derived properties), which would force repeated
++            // cancel-and-restart cycles and look like the text bouncing.
++            if (root.width < root.textItem.implicitWidth && root.textItem.lineCount === 1) {
++                root.revealOffset = root.width - root.textItem.implicitWidth;
+                 root.state = "ShowRight";
+             }
+         }
+     }
+ 
++    Timer {
++        id: endTimer
++        interval: root.endDelay
++        repeat: false
++        onTriggered: {
++            if (root.state === "ShowRight" && root.hovered) {
++                root.state = "";
++            }
++        }
++    }
++
++    // Fires exactly when the forward reveal animation is expected to
++    // finish (same duration formula, started at the same instant the
++    // "ShowRight" state is entered). A direct onFinished handler on the
++    // Transition's NumberAnimation was tried instead of this and proved
++    // unreliable in practice (it did not consistently fire), so this
++    // binding-driven timer - which shares the exact same duration formula
++    // and starts at the exact same instant as the real animation - is used
++    // instead. Any genuine interruption (leave, content/width change)
++    // changes root.state away from "ShowRight" before this fires, and the
++    // onTriggered guard below no-ops in that case.
++    Timer {
++        id: forwardCompleteTimer
++        interval: Math.abs(root.revealOffset) * root.forwardMsPerPixel
++        running: root.state === "ShowRight" && root.autoReturn
++        repeat: false
++        onTriggered: {
++            if (root.state === "ShowRight" && root.hovered) {
++                endTimer.restart();
++            }
++        }
++    }
++
++    // Mirrors forwardCompleteTimer for the return-to-start leg: fires when
++    // the reverse transition is expected to have finished, so a
++    // content/width-triggered re-arm only restarts the initial delay once
++    // the text has actually settled back at x=0.
++    Timer {
++        id: returnCompleteTimer
++        interval: Math.min(root.maxReturnDuration, Math.max(root.minReturnDuration,
++            Math.abs(root.revealOffset) * root.returnMsPerPixel))
++        running: root.state === "" && root.pendingRearm
++        repeat: false
++        onTriggered: {
++            root.pendingRearm = false;
++            if (root.hovered) {
++                startTimer.restart();
++            }
++        }
++    }
++
+     states: [
+         State {
+             name: ""
+@@ -48,18 +221,32 @@
+         State {
+             name: "ShowRight"
+             PropertyChanges {
+-                root.textItem.x: root.width - root.textItem.implicitWidth
++                root.textItem.x: root.revealOffset
+             }
+         }
+     ]
+ 
+-    transitions: Transition {
+-        to: "ShowRight"
+-        NumberAnimation {
+-            target: root.textItem
+-            properties: "x"
+-            easing.type: Easing.Linear
+-            duration: Math.abs(root.textItem.implicitWidth - root.width) * 25
++    transitions: [
++        Transition {
++            to: "ShowRight"
++            NumberAnimation {
++                target: root.textItem
++                properties: "x"
++                easing.type: Easing.Linear
++                duration: Math.abs(root.revealOffset) * root.forwardMsPerPixel
++            }
++        },
++        Transition {
++            from: "ShowRight"
++            to: ""
++            enabled: root.animatedReturn
++            NumberAnimation {
++                target: root.textItem
++                properties: "x"
++                easing.type: Easing.Linear
++                duration: Math.min(root.maxReturnDuration, Math.max(root.minReturnDuration,
++                    Math.abs(root.revealOffset) * root.returnMsPerPixel))
++            }
+         }
+-    }
++    ]
+ }
+diff --git a/applets/taskmanager/qml/Task.qml b/applets/taskmanager/qml/Task.qml
+--- a/applets/taskmanager/qml/Task.qml
++++ b/applets/taskmanager/qml/Task.qml
+@@ -604,8 +604,8 @@
+         }
+     }
+ 
+-    PlasmaComponents3.Label {
+-        id: label
++    ScrollableTextWrapper {
++        id: labelScroller
+ 
+         visible: (task.inPopup || !task.tasksRoot.iconsOnly && !task.model.IsLauncher
+             && (parent.width - iconBox.height - Kirigami.Units.smallSpacing) >= TaskManagerApplet.LayoutMetrics.spaceRequiredToShowText())
+@@ -618,25 +618,80 @@
+             bottomMargin: taskFrame.margins.bottom
+         }
+ 
+-        wrapMode: (maximumLineCount === 1) ? Text.NoWrap : Text.Wrap
+-        elide: Text.ElideRight
+-        textFormat: Text.PlainText
+-        verticalAlignment: Text.AlignVCenter
+-        maximumLineCount: Plasmoid.configuration.maxTextLines || undefined
+-
+-        // The accessible item of this element is only used for debugging
+-        // purposes, and it will never gain focus (thus it won't interfere
+-        // with screenreaders).
+-        Accessible.ignored: !visible
+-        Accessible.name: parent.Accessible.name + "-labelhint"
+-
+-        // use State to avoid unnecessary re-evaluation when the label is invisible
+-        states: State {
+-            name: "labelVisible"
+-            when: label.visible
+-
+-            PropertyChanges {
+-                label.text: task.model.display
++        // Kept as a pure, stable hover signal - see the lineCount check
++        // inside ScrollableTextWrapper's startTimer for why the
++        // single-line gating isn't folded in here.
++        hovered: task.containsMouse
++        // task.containsMouse (above) already provides hover; disables this
++        // wrapper's own MouseArea input/hover handling entirely so it
++        // cannot interfere with task's own ToolTipArea hover state (which
++        // drives the window preview popup).
++        selfDetectHover: false
++        startDelay: 300
++        endDelay: 500
++        autoReturn: true
++        animatedReturn: true
++        resetOnContentChange: true
++
++        textItem: PlasmaComponents3.Label {
++            id: label
++
++            // ScrollableTextWrapper only binds textItem.width, not height
++            // (a caller-imposed height would fight PlayerController's own
++            // Layout.preferredHeight: songText.height, which derives the
++            // *wrapper's* height from the label instead). Task.qml needs
++            // the reverse relationship - the label filling the task
++            // button's fixed title-row height, exactly as it did before
++            // this wrap (previously via anchors.fill: parent) - so that
++            // relationship is restored here instead of in the shared
++            // component. Without it, Text.ElideRight + Text.Wrap (the
++            // default maxTextLines: 0 config) has no height to elide
++            // against and can wrap across multiple lines instead of
++            // eliding, which also permanently blocks scrolling since
++            // ScrollableTextWrapper requires lineCount === 1.
++            height: labelScroller.height
++
++            // Forced to NoWrap for as long as revealActive is true,
++            // regardless of maxTextLines config: with elide switched to
++            // ElideNone during the reveal/return, the full (longer)
++            // unelided string needs more horizontal space than fits at the
++            // task's width - if wrapMode stayed Text.Wrap, Qt lays that
++            // full string out across multiple lines instead of one long
++            // line extending past the clipping viewport (confirmed
++            // directly: lineCount jumps from 1 to 5 with ElideNone+Wrap on
++            // representative long text), which then renders as a garbled,
++            // vertically-centered multi-line fragment clipped by
++            // labelScroller's fixed height. NoWrap is exactly what makes
++            // the "long single line clipped by a fixed-width viewport"
++            // scrolling model actually hold.
++            wrapMode: labelScroller.revealActive
++                ? Text.NoWrap
++                : ((label.maximumLineCount === 1) ? Text.NoWrap : Text.Wrap)
++            // ScrollableTextWrapper clips/keeps the full string rendered
++            // for as long as revealActive is true, which (with
++            // animatedReturn: true here) spans the whole return animation
++            // too, not just state === "ShowRight" - matching that instead
++            // of the raw state avoids briefly re-eliding and unclipping
++            // the label while it is still animating back from a negative x.
++            elide: labelScroller.revealActive ? Text.ElideNone : Text.ElideRight
++            textFormat: Text.PlainText
++            verticalAlignment: Text.AlignVCenter
++            maximumLineCount: Plasmoid.configuration.maxTextLines || undefined
++
++            // The accessible item of this element is only used for debugging
++            // purposes, and it will never gain focus (thus it won't interfere
++            // with screenreaders).
++            Accessible.ignored: !labelScroller.visible
++            Accessible.name: labelScroller.parent.Accessible.name + "-labelhint"
++
++            // use State to avoid unnecessary re-evaluation when the label is invisible
++            states: State {
++                name: "labelVisible"
++                when: labelScroller.visible
++
++                PropertyChanges {
++                    label.text: task.model.display
++                }
+             }
+         }
+     }

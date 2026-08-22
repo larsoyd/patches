@@ -10,7 +10,8 @@ to; each directory documents the purpose of its patches and how to apply them.
 | --- | --- | ---: | --- |
 | [`firefox/`](firefox/) | Mozilla Firefox | 1 | Prevent a link-target status panel from remaining visible after an intercepted click. |
 | [`lutris/`](lutris/) | Lutris | 2 | Select GTK 3 explicitly and obtain Vulkan GPU identity without parsing `vulkaninfo`. |
-| [`plasma-desktop/`](plasma-desktop/) | KDE Plasma Desktop | 2 | Adjust the Kickoff footer layout and clear Folder View selection after launching an item. |
+| [`plasma-desktop/`](plasma-desktop/) | KDE Plasma Desktop | 3 | Adjust Kickoff and Folder View behavior and scroll overflowing Task Manager labels on hover. |
+| [`wine-tkg/`](wine-tkg/) | Wine-tkg | 3 | Add portal-backed file dialogs and Wine Wayland server-side decorations. |
 
 ## Applying patches
 
