@@ -1,0 +1,80 @@
+/* Remove the tab close icon/button */
+.tab-close-button,
+.tab-close-button.close-icon {
+    display: none !important;
+}
+
+/* Remove tab audio (speaker/mute/autoplay-blocked) indicators in all tab-strip modes */
+.tab-audio-button,
+.tab-icon-overlay:is([soundplaying], [muted], [activemedia-blocked]) {
+    display: none !important;
+}
+
+/* Light blue border around tabs that are currently playing audio */
+.tabbrowser-tab[soundplaying] .tab-background {
+    box-shadow: inset 0 0 0 2px #6ba65e !important;
+}
+
+/* Minimize button */
+.titlebar-min > .toolbarbutton-icon {
+    background-image: url("buttons/minimize-normal.svg") !important;
+    background-repeat: no-repeat !important;
+    background-size: 18px 18px !important;
+    background-position: center !important;
+    background-color: transparent !important;
+    color: transparent !important;
+}
+.titlebar-min:hover > .toolbarbutton-icon {
+    background-image: url("buttons/minimize-hover.svg") !important;
+    background-color: transparent !important;
+    color: transparent !important;
+    background-size: 20px 20px !important;
+}
+
+/* Maximize button */
+.titlebar-max > .toolbarbutton-icon {
+    background-image: url("buttons/maximize-normal.svg") !important;
+    background-repeat: no-repeat !important;
+    background-size: 18px 18px !important;
+    background-position: center !important;
+    background-color: transparent !important;
+    color: transparent !important;
+}
+.titlebar-max:hover > .toolbarbutton-icon {
+    background-image: url("buttons/maximize-hover.svg") !important;
+    background-color: transparent !important;
+    color: transparent !important;
+    background-size: 20px 20px !important;
+}
+
+/* Restore button */
+.titlebar-restore > .toolbarbutton-icon {
+    background-image: url("buttons/maximized-normal.svg") !important;
+    background-repeat: no-repeat !important;
+    background-size: 18px 18px !important;
+    background-position: center !important;
+    background-color: transparent !important;
+    color: transparent !important;
+}
+.titlebar-restore:hover > .toolbarbutton-icon {
+    background-image: url("buttons/maximized-hover.svg") !important;
+    background-color: transparent !important;
+    color: transparent !important;
+    background-size: 20px 20px !important;
+}
+
+/* Close button */
+.titlebar-close > .toolbarbutton-icon {
+    background-image: url("buttons/close-normal.svg") !important;
+    background-repeat: no-repeat !important;
+    background-size: 18px 18px !important;
+    background-position: center !important;
+    background-color: transparent !important;
+    color: transparent !important;
+}
+.titlebar-close:hover > .toolbarbutton-icon {
+    background-image: url("buttons/close-active.svg") !important;
+    background-color: transparent !important;
+    color: transparent !important;
+    background-size: 20px 20px !important;
+}
