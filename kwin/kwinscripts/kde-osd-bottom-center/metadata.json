@@ -1,0 +1,17 @@
+{
+  "KPlugin": {
+    "Id": "kde-osd-bottom-center",
+    "Name": "KDE OSD Bottom Center",
+    "Description": "Places KDE on-screen displays near the bottom center, just above the panel.",
+    "Version": "1.0.0",
+    "License": "MIT",
+    "Authors": [
+      {
+        "Name": "Lars"
+      }
+    ]
+  },
+  "X-Plasma-API": "javascript",
+  "X-Plasma-MainScript": "code/main.js",
+  "KPackageStructure": "KWin/Script"
+}

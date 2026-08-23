@@ -1,0 +1,572 @@
+From: Movie Maker Wine investigation <wine-tkg@localhost>
+Date: Sun, 24 Aug 2026 00:00:00 +0200
+Subject: [PATCH] ntdll: Implement MUI satellite resource redirection.
+
+Windows Vista+ modules can ship as "language neutral" (LN): most or all
+localized resources (strings, dialogs, menus, ...) are stripped out of
+the main module into a separate "<lang>\<module>.mui" satellite PE next
+to it, redirected to transparently by the real resource-loading APIs.
+The LN module carries its own resource of type "MUI" (id 1) describing
+which resource types are redirected and which language(s)/ultimate
+fallback to try.
+
+Wine's resource loader (LdrFindResource_U / access_resource) had no
+support for this at all, so any resource lookup for a type stripped out
+of an MUI-packaged LN module failed as though the resource genuinely
+didn't exist, regardless of language settings.
+
+This implements MUI satellite lookup end to end:
+
+ - find_mui_config() locates and validates the LN module's own "MUI"
+   resource-configuration block (signature, size and offset/length
+   bounds all checked before trusting any field in it).
+ - try_mui_find_entry(), hooked into LdrFindResource_U, resolves the
+   preferred language (explicit request, else user/system default, else
+   the LN module's declared ultimate-fallback language), locates or
+   loads the corresponding satellite (mapped as an image section so the
+   existing RVA-based resource-walking code works against it
+   unmodified), validates it against the LN module via the paired
+   Service/Content checksums Windows generates for exactly this
+   purpose, and re-resolves the lookup against it.
+ - try_mui_redirect_module(), hooked into access_resource, rewrites the
+   module handle used for the final RVA-to-VA computation when the
+   resource-data-entry pointer it's given actually lives inside a
+   satellite's mapped image rather than the LN module's own.
+
+Satellite mappings are cached and kept alive for the loading module's
+lifetime; a type only gets MUI treatment if the LN module's own "MUI"
+config lists it as redirected, so modules without an MUI descriptor
+(the overwhelming majority) are entirely unaffected. Resource lookups
+against LOAD_LIBRARY_AS_DATAFILE-mapped modules are left untouched
+(get_module_nt_path only resolves normally loaded modules) - narrower
+than real Windows, but sufficient for every known caller and avoids
+the extra data-module path-tracking infrastructure that would
+otherwise be needed.
+
+Confirmed against a minimal real-fault winegcc harness (a stripped LN
+PE plus a matching en-US satellite, calling LoadStringW for a
+satellite-only string) and against Windows Movie Maker 6.0, whose
+MOVIEMK.dll ships exactly this way: previously every localized string/
+dialog/menu lookup failed, propagating as an internal E_FAIL that
+aborted application startup; with this patch LoadStringW/FindResource
+correctly resolve through the en-US satellite and the application
+reaches its normal main window.
+---
+ dlls/ntdll/resource.c | 479 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 478 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/resource.c b/dlls/ntdll/resource.c
+index 46ded65d509..0dfe7c87266 100644
+--- a/dlls/ntdll/resource.c
++++ b/dlls/ntdll/resource.c
+@@ -34,9 +34,11 @@
+ #include "winbase.h"
+ #include "winnt.h"
+ #include "winternl.h"
++#include "ddk/ntddk.h"
+ #include "ntdll_misc.h"
+ #include "wine/asm.h"
+ #include "wine/exception.h"
++#include "wine/list.h"
+ #include "wine/debug.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(resource);
+@@ -250,6 +252,479 @@ done:
+ }
+ 
+ 
++/**********************************************************************
++ *  MUI (Multilingual User Interface) satellite resource redirection.
++ *
++ * Vista+ modules can ship "language neutral" (LN), with most or all
++ * localized resources (strings, dialogs, menus, ...) stripped out into
++ * a separate "<lang>\<module>.mui" satellite PE next to the main
++ * module, which the real resource-loading APIs redirect to
++ * transparently. The LN module carries its own resource of type "MUI"
++ * (id 1) describing which resource types are redirected and which
++ * language(s) to try. Without this, every resource lookup for a type
++ * stripped out of an MUI-packaged LN module fails as though the
++ * resource genuinely doesn't exist, because nothing here ever looked
++ * for a satellite file.
++ */
++
++#define MUI_SIGNATURE 0xfecdfecd
++
++#define MUI_FILETYPE_LANGUAGE_NEUTRAL  0x01
++#define MUI_FILETYPE_LANGUAGE_SPECIFIC 0x02
++
++struct mui_resource_config
++{
++    DWORD Signature;
++    DWORD Size;
++    DWORD RCConfigVersion;
++    DWORD PathType;
++    DWORD FileType;
++    DWORD SystemAttributes;
++    DWORD UltimateFallbackLocation;
++    BYTE  ServiceChecksum[16];
++    BYTE  Checksum[16];
++    DWORD Unknown[6];
++    DWORD MainNameTypesOffset, MainNameTypesLength;
++    DWORD MainIDTypesOffset, MainIDTypesLength;
++    DWORD MuiNameTypesOffset, MuiNameTypesLength;
++    DWORD MuiIDTypesOffset, MuiIDTypesLength;
++    DWORD LanguageOffset, LanguageLength;
++    DWORD UltimateFallbackLanguageOffset, UltimateFallbackLanguageLength;
++};
++
++struct mui_satellite
++{
++    struct list entry;
++    void *base;
++    const struct mui_resource_config *config;
++};
++
++struct mui_module
++{
++    struct list entry;
++    HMODULE module;
++    const struct mui_resource_config *config;  /* NULL if not MUI-aware */
++    struct list satellites;
++};
++
++static struct list mui_modules = LIST_INIT( mui_modules );
++
++static RTL_CRITICAL_SECTION mui_section;
++static RTL_CRITICAL_SECTION_DEBUG mui_critsect_debug =
++{
++    0, 0, &mui_section,
++    { &mui_critsect_debug.ProcessLocksList, &mui_critsect_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": mui_section") }
++};
++static RTL_CRITICAL_SECTION mui_section = { &mui_critsect_debug, -1, 0, 0, 0, 0 };
++
++static BOOL mui_range_valid( const struct mui_resource_config *cfg, DWORD off, DWORD len )
++{
++    return !len || (off < cfg->Size && len <= cfg->Size - off);
++}
++
++/**********************************************************************
++ *  find_mui_config
++ *
++ * Validate and return the MUI resource-configuration block embedded
++ * in a module's own resources, or NULL if it doesn't have one.
++ */
++static const struct mui_resource_config *find_mui_config( HMODULE mod )
++{
++    static const WCHAR muiW[] = {'M','U','I',0};
++    LDR_RESOURCE_INFO info;
++    const IMAGE_RESOURCE_DATA_ENTRY *data_entry;
++    const struct mui_resource_config *cfg;
++    NTSTATUS status;
++    void *ptr;
++    ULONG size;
++
++    info.Type = (ULONG_PTR)muiW;
++    info.Name = 1;
++    info.Language = 0;
++
++    if (find_entry( mod, &info, 3, (const void **)&data_entry, FALSE ) != STATUS_SUCCESS)
++        return NULL;
++    status = LdrAccessResource( mod, data_entry, &ptr, &size );
++    if (status != STATUS_SUCCESS) return NULL;
++
++    cfg = ptr;
++    if (size < sizeof(*cfg)) return NULL;
++    if (cfg->Signature != MUI_SIGNATURE) return NULL;
++    if (cfg->Size < sizeof(*cfg) || cfg->Size > size) return NULL;
++
++    if (!mui_range_valid( cfg, cfg->MainNameTypesOffset, cfg->MainNameTypesLength ) ||
++        !mui_range_valid( cfg, cfg->MainIDTypesOffset, cfg->MainIDTypesLength ) ||
++        !mui_range_valid( cfg, cfg->MuiNameTypesOffset, cfg->MuiNameTypesLength ) ||
++        !mui_range_valid( cfg, cfg->MuiIDTypesOffset, cfg->MuiIDTypesLength ) ||
++        !mui_range_valid( cfg, cfg->LanguageOffset, cfg->LanguageLength ) ||
++        !mui_range_valid( cfg, cfg->UltimateFallbackLanguageOffset, cfg->UltimateFallbackLanguageLength ))
++        return NULL;
++
++    return cfg;
++}
++
++/**********************************************************************
++ *  mui_type_redirected
++ *
++ * Whether a resource type is listed as MUI-redirected (mui_list TRUE)
++ * or as staying in the main/LN module (mui_list FALSE) by the config.
++ */
++static BOOL mui_type_redirected( const struct mui_resource_config *cfg, ULONG_PTR type, BOOL mui_list )
++{
++    if (IS_INTRESOURCE(type))
++    {
++        DWORD offset = mui_list ? cfg->MuiIDTypesOffset : cfg->MainIDTypesOffset;
++        DWORD length = mui_list ? cfg->MuiIDTypesLength : cfg->MainIDTypesLength;
++        const DWORD *ids = (const DWORD *)((const char *)cfg + offset);
++        unsigned int i;
++
++        for (i = 0; i < length / sizeof(DWORD); i++)
++            if (ids[i] == type) return TRUE;
++    }
++    else
++    {
++        DWORD offset = mui_list ? cfg->MuiNameTypesOffset : cfg->MainNameTypesOffset;
++        DWORD length = mui_list ? cfg->MuiNameTypesLength : cfg->MainNameTypesLength;
++        const WCHAR *s = (const WCHAR *)((const char *)cfg + offset);
++        const WCHAR *end = (const WCHAR *)((const char *)s + length);
++
++        while (s < end && *s)
++        {
++            size_t len = wcsnlen( s, end - s );
++            if (!wcsnicmp( (const WCHAR *)type, s, len + 1 )) return TRUE;
++            s += len + 1;
++        }
++    }
++    return FALSE;
++}
++
++/**********************************************************************
++ *  get_module_nt_path
++ *
++ * Retrieve the NT path of an already-loaded module. Data-file-mapped
++ * modules aren't supported here - MUI redirection is only attempted
++ * against normally loaded application/library modules.
++ */
++static NTSTATUS get_module_nt_path( HMODULE mod, UNICODE_STRING *nt_path )
++{
++    LDR_DATA_TABLE_ENTRY *pldr;
++    WCHAR *dos_path;
++    NTSTATUS status;
++    ULONG_PTR magic;
++    SIZE_T len;
++
++    LdrLockLoaderLock( 0, NULL, &magic );
++    status = LdrFindEntryForAddress( (HMODULE)((ULONG_PTR)mod & ~(ULONG_PTR)3), &pldr );
++    if (status == STATUS_SUCCESS)
++    {
++        len = pldr->FullDllName.Length;
++        if ((dos_path = RtlAllocateHeap( GetProcessHeap(), 0, len + sizeof(WCHAR) )))
++        {
++            memcpy( dos_path, pldr->FullDllName.Buffer, len );
++            dos_path[len / sizeof(WCHAR)] = 0;
++        }
++        else status = STATUS_NO_MEMORY;
++    }
++    LdrUnlockLoaderLock( 0, magic );
++    if (status != STATUS_SUCCESS) return status;
++
++    status = RtlDosPathNameToNtPathName_U_WithStatus( dos_path, nt_path, NULL, NULL );
++    RtlFreeHeap( GetProcessHeap(), 0, dos_path );
++    return status;
++}
++
++/**********************************************************************
++ *  form_mui_path
++ *
++ * Given the NT path of the LN module and a language name, build the
++ * expected NT path of that language's satellite MUI file:
++ * "...\dir\<lang>\basename.ext.mui".
++ */
++static NTSTATUS form_mui_path( const UNICODE_STRING *module_path, const UNICODE_STRING *lang,
++                               UNICODE_STRING *mui_path )
++{
++    static const WCHAR suffix[] = {'.','m','u','i',0};
++    unsigned int i, basename = 0;
++    WCHAR *buf;
++
++    for (i = 0; i < module_path->Length / sizeof(WCHAR); i++)
++        if (module_path->Buffer[i] == '\\') basename = i + 1;
++
++    mui_path->MaximumLength = module_path->Length + lang->Length + sizeof(WCHAR) + sizeof(suffix);
++    if (!(buf = RtlAllocateHeap( GetProcessHeap(), 0, mui_path->MaximumLength ))) return STATUS_NO_MEMORY;
++
++    memcpy( buf, module_path->Buffer, basename * sizeof(WCHAR) );
++    memcpy( buf + basename, lang->Buffer, lang->Length );
++    buf[basename + lang->Length / sizeof(WCHAR)] = '\\';
++    memcpy( buf + basename + lang->Length / sizeof(WCHAR) + 1,
++            module_path->Buffer + basename, module_path->Length - basename * sizeof(WCHAR) );
++    memcpy( (char *)buf + module_path->Length + lang->Length + sizeof(WCHAR), suffix, sizeof(suffix) );
++
++    mui_path->Buffer = buf;
++    mui_path->Length = module_path->Length + lang->Length + sizeof(WCHAR) + sizeof(suffix) - sizeof(WCHAR);
++    return STATUS_SUCCESS;
++}
++
++/**********************************************************************
++ *  load_mui_satellite
++ *
++ * Map a satellite MUI file as an image section, exactly like a normal
++ * PE module - so the existing RVA-based resource-walking code can be
++ * reused unmodified against it.
++ */
++static NTSTATUS load_mui_satellite( const UNICODE_STRING *path, void **base )
++{
++    OBJECT_ATTRIBUTES attr;
++    IO_STATUS_BLOCK io;
++    HANDLE file, section;
++    NTSTATUS status;
++    SIZE_T size = 0;
++
++    InitializeObjectAttributes( &attr, (UNICODE_STRING *)path, OBJ_CASE_INSENSITIVE, NULL, NULL );
++    status = NtCreateFile( &file, GENERIC_READ | SYNCHRONIZE, &attr, &io, NULL, 0,
++                           FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_OPEN,
++                           FILE_SYNCHRONOUS_IO_ALERT | FILE_NON_DIRECTORY_FILE, NULL, 0 );
++    if (status != STATUS_SUCCESS) return status;
++
++    status = NtCreateSection( &section, SECTION_MAP_READ, NULL, NULL, PAGE_READONLY, SEC_IMAGE, file );
++    NtClose( file );
++    if (status != STATUS_SUCCESS) return status;
++
++    *base = NULL;
++    status = NtMapViewOfSection( section, NtCurrentProcess(), base, 0, 0, NULL, &size,
++                                 ViewShare, 0, PAGE_READONLY );
++    NtClose( section );
++    /* STATUS_IMAGE_NOT_AT_BASE is an informational success code (the satellite's
++     * preferred base was already taken and it got relocated) - not a failure. */
++    if (!NT_SUCCESS( status )) return status;
++    return STATUS_SUCCESS;
++}
++
++/**********************************************************************
++ *  validate_mui_satellite
++ *
++ * A satellite must be paired with its LN module: same service/content
++ * checksums (Windows generates these together and refuses a mismatch,
++ * e.g. after a partial update), and its own Language must match what
++ * was actually requested.
++ */
++static BOOL validate_mui_satellite( const struct mui_resource_config *ln_cfg,
++                                    const struct mui_resource_config *sat_cfg,
++                                    const UNICODE_STRING *lang )
++{
++    UNICODE_STRING sat_lang;
++
++    if (!(sat_cfg->FileType & MUI_FILETYPE_LANGUAGE_SPECIFIC)) return FALSE;
++    if (memcmp( sat_cfg->ServiceChecksum, ln_cfg->ServiceChecksum, sizeof(sat_cfg->ServiceChecksum) )) return FALSE;
++    if (memcmp( sat_cfg->Checksum, ln_cfg->Checksum, sizeof(sat_cfg->Checksum) )) return FALSE;
++
++    sat_lang.Buffer = (WCHAR *)((const char *)sat_cfg + sat_cfg->LanguageOffset);
++    sat_lang.Length = sat_lang.MaximumLength = sat_cfg->LanguageLength;
++    while (sat_lang.Length >= sizeof(WCHAR) && !sat_lang.Buffer[sat_lang.Length / sizeof(WCHAR) - 1])
++        sat_lang.Length -= sizeof(WCHAR);
++
++    return RtlEqualUnicodeString( &sat_lang, lang, TRUE );
++}
++
++/**********************************************************************
++ *  find_or_load_satellite
++ *
++ * Return the mapped base of the satellite for a given language, from
++ * cache if already loaded, otherwise mapping and validating it fresh.
++ * Satellite mappings are kept for the module's lifetime.
++ */
++static NTSTATUS find_or_load_satellite( struct mui_module *mm, const UNICODE_STRING *module_path,
++                                        const UNICODE_STRING *lang, void **satellite )
++{
++    struct mui_satellite *ms;
++    UNICODE_STRING mui_path;
++    const struct mui_resource_config *cfg;
++    void *base;
++    NTSTATUS status;
++
++    LIST_FOR_EACH_ENTRY( ms, &mm->satellites, struct mui_satellite, entry )
++    {
++        UNICODE_STRING have;
++        have.Buffer = (WCHAR *)((const char *)ms->config + ms->config->LanguageOffset);
++        have.Length = have.MaximumLength = ms->config->LanguageLength;
++        while (have.Length >= sizeof(WCHAR) && !have.Buffer[have.Length / sizeof(WCHAR) - 1])
++            have.Length -= sizeof(WCHAR);
++        if (RtlEqualUnicodeString( &have, lang, TRUE ))
++        {
++            *satellite = ms->base;
++            return STATUS_SUCCESS;
++        }
++    }
++
++    status = form_mui_path( module_path, lang, &mui_path );
++    if (status != STATUS_SUCCESS) return status;
++
++    status = load_mui_satellite( &mui_path, &base );
++    RtlFreeHeap( GetProcessHeap(), 0, mui_path.Buffer );
++    if (status != STATUS_SUCCESS) return status;
++
++    cfg = find_mui_config( base );
++    if (!cfg || !validate_mui_satellite( mm->config, cfg, lang ))
++    {
++        NtUnmapViewOfSection( NtCurrentProcess(), base );
++        return STATUS_MUI_INVALID_FILE;
++    }
++
++    if (!(ms = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*ms) )))
++    {
++        NtUnmapViewOfSection( NtCurrentProcess(), base );
++        return STATUS_NO_MEMORY;
++    }
++    ms->base = base;
++    ms->config = cfg;
++    list_add_tail( &mm->satellites, &ms->entry );
++
++    *satellite = base;
++    return STATUS_SUCCESS;
++}
++
++/**********************************************************************
++ *  get_mui_module
++ *
++ * Find or create the cached MUI tracking entry for a module, probing
++ * its resources for an "MUI" config block the first time it's seen.
++ */
++static struct mui_module *get_mui_module( HMODULE mod )
++{
++    struct mui_module *mm;
++
++    RtlEnterCriticalSection( &mui_section );
++
++    LIST_FOR_EACH_ENTRY( mm, &mui_modules, struct mui_module, entry )
++        if (mm->module == mod) goto done;
++
++    if ((mm = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(*mm) )))
++    {
++        mm->module = mod;
++        mm->config = find_mui_config( mod );
++        list_init( &mm->satellites );
++        list_add_tail( &mui_modules, &mm->entry );
++    }
++
++done:
++    RtlLeaveCriticalSection( &mui_section );
++    return mm;
++}
++
++/**********************************************************************
++ *  try_mui_find_entry
++ *
++ * Called from LdrFindResource_U. Returns TRUE if the MUI redirection
++ * logic determined the answer (*status is then meaningful) - FALSE
++ * means fall through to the ordinary in-module lookup.
++ */
++static BOOL try_mui_find_entry( HMODULE hmod, const LDR_RESOURCE_INFO *info, ULONG level,
++                                const void **ret, NTSTATUS *status )
++{
++    static const WCHAR muiW[] = {'M','U','I',0};
++    struct mui_module *mm;
++    UNICODE_STRING module_path, lang;
++    void *satellite;
++    NTSTATUS nts;
++
++    /* the MUI descriptor resource itself always lives in the LN module */
++    if (level >= 1 && !IS_INTRESOURCE(info->Type) && !wcscmp( (const WCHAR *)info->Type, muiW ))
++        return FALSE;
++
++    if (!(mm = get_mui_module( hmod ))) return FALSE;
++    if (!mm->config || !(mm->config->FileType & MUI_FILETYPE_LANGUAGE_NEUTRAL)) return FALSE;
++    if (level < 3) return FALSE;
++    if (!mui_type_redirected( mm->config, info->Type, TRUE )) return FALSE;
++
++    if (get_module_nt_path( hmod, &module_path ) != STATUS_SUCCESS) return FALSE;
++
++    nts = STATUS_MUI_FILE_NOT_FOUND;
++
++    if (info->Language && RtlLcidToLocaleName( info->Language, &lang, 0, TRUE ) == STATUS_SUCCESS)
++    {
++        nts = find_or_load_satellite( mm, &module_path, &lang, &satellite );
++        RtlFreeUnicodeString( &lang );
++    }
++    else
++    {
++        LCID candidates[2];
++        unsigned int i;
++
++        candidates[0] = LOCALE_USER_DEFAULT;
++        candidates[1] = LOCALE_SYSTEM_DEFAULT;
++        for (i = 0; i < ARRAY_SIZE(candidates) && nts != STATUS_SUCCESS; i++)
++        {
++            if (RtlLcidToLocaleName( candidates[i], &lang, 0, TRUE ) != STATUS_SUCCESS) continue;
++            nts = find_or_load_satellite( mm, &module_path, &lang, &satellite );
++            RtlFreeUnicodeString( &lang );
++        }
++        if (nts != STATUS_SUCCESS && mm->config->UltimateFallbackLanguageLength)
++        {
++            lang.Buffer = (WCHAR *)((const char *)mm->config + mm->config->UltimateFallbackLanguageOffset);
++            lang.Length = lang.MaximumLength = mm->config->UltimateFallbackLanguageLength;
++            while (lang.Length >= sizeof(WCHAR) && !lang.Buffer[lang.Length / sizeof(WCHAR) - 1])
++                lang.Length -= sizeof(WCHAR);
++            nts = find_or_load_satellite( mm, &module_path, &lang, &satellite );
++        }
++    }
++
++    RtlFreeUnicodeString( &module_path );
++
++    if (nts == STATUS_SUCCESS) nts = find_entry( satellite, info, level, ret, FALSE );
++
++    /* if the type is legitimately allowed to stay in the LN module too, let a
++     * failed MUI lookup fall back to the ordinary path instead of failing hard */
++    if (nts != STATUS_SUCCESS && mui_type_redirected( mm->config, info->Type, FALSE )) return FALSE;
++
++    *status = nts;
++    return TRUE;
++}
++
++/**********************************************************************
++ *  try_mui_redirect_module
++ *
++ * Called from access_resource. A resource-data-entry pointer returned
++ * via MUI redirection lives inside a satellite's own mapped image, not
++ * the LN module's - rewrite the module handle backing the final
++ * RVA-to-VA computation to match whichever mapping the entry is
++ * actually in.
++ */
++static void try_mui_redirect_module( HMODULE *hmod, const IMAGE_RESOURCE_DATA_ENTRY *entry )
++{
++    void *base = (void *)((ULONG_PTR)*hmod & ~(ULONG_PTR)3);
++    const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( base );
++    struct mui_module *mm = NULL, *mm2;
++    struct mui_satellite *ms;
++    ULONG image_size;
++
++    if (!nt) return;
++    image_size = nt->OptionalHeader.SizeOfImage;
++    if ((const char *)entry >= (const char *)base && (const char *)entry < (const char *)base + image_size)
++        return;  /* entry belongs to the LN module itself */
++
++    RtlEnterCriticalSection( &mui_section );
++    LIST_FOR_EACH_ENTRY( mm2, &mui_modules, struct mui_module, entry )
++        if (mm2->module == *hmod) { mm = mm2; break; }
++    if (mm)
++    {
++        LIST_FOR_EACH_ENTRY( ms, &mm->satellites, struct mui_satellite, entry )
++        {
++            const IMAGE_NT_HEADERS *sat_nt = RtlImageNtHeader( ms->base );
++            ULONG sat_size = sat_nt ? sat_nt->OptionalHeader.SizeOfImage : 0;
++
++            if ((const char *)entry >= (const char *)ms->base &&
++                (const char *)entry < (const char *)ms->base + sat_size)
++            {
++                *hmod = ms->base;
++                break;
++            }
++        }
++    }
++    RtlLeaveCriticalSection( &mui_section );
++}
++
++
+ /**********************************************************************
+  *	LdrFindResourceDirectory_U  (NTDLL.@)
+  */
+@@ -294,7 +769,8 @@ NTSTATUS WINAPI DECLSPEC_HOTPATCH LdrFindResource_U( HMODULE hmod, const LDR_RES
+                      level > 1 ? debugstr_w((LPCWSTR)info->Name) : "",
+                      level > 2 ? info->Language : 0, level );
+ 
+-        status = find_entry( hmod, info, level, &res, FALSE );
++        if (!try_mui_find_entry( hmod, info, level, &res, &status ))
++            status = find_entry( hmod, info, level, &res, FALSE );
+         if (status == STATUS_SUCCESS) *entry = res;
+     }
+     __EXCEPT_PAGE_FAULT
+@@ -321,6 +797,8 @@ static inline NTSTATUS access_resource( HMODULE hmod, const IMAGE_RESOURCE_DATA_
+     {
+         ULONG dirsize;
+ 
++        try_mui_redirect_module( &hmod, entry );
++
+         if (!RtlImageDirectoryEntryToData( hmod, TRUE, IMAGE_DIRECTORY_ENTRY_RESOURCE, &dirsize ))
+             status = STATUS_RESOURCE_DATA_NOT_FOUND;
+         else
