@@ -9,11 +9,11 @@ how to install or apply them.
 
 | Directory | Project | Contents | Summary |
 | --- | --- | ---: | --- |
-| [`firefox/`](firefox/) | Mozilla Firefox | 1 patch, 2 profile customizations | Fix a stuck link-target panel, use KDE/GTK titlebar buttons, and select Split View panes on hover. |
-| [`lutris/`](lutris/) | Lutris | 2 | Select GTK 3 explicitly and obtain Vulkan GPU identity without parsing `vulkaninfo`. |
-| [`plasma-desktop/`](plasma-desktop/) | KDE Plasma Desktop | 3 | Adjust Kickoff and Folder View behavior and scroll overflowing Task Manager labels on hover. |
-| [`wine-tkg/`](wine-tkg/) | Wine-tkg | 3 | Add portal-backed file dialogs and Wine Wayland server-side decorations. |
-| [`kpipewire/`](kpipewire/) | kPipewire | 1 | Fixed a bug where KDE's task thumbnails on the taskbar would not work by raising a buffer. |
+| [`firefox/`](firefox/) | Mozilla Firefox | 1 patch, 2 profile customizations | Fixes a stuck link-target panel, uses KDE/GTK titlebar buttons, and selects Split View panes on hover. |
+| [`lutris/`](lutris/) | Lutris | 2 | Selects GTK 3 explicitly and obtains Vulkan GPU identity without parsing `vulkaninfo`. |
+| [`plasma-desktop/`](plasma-desktop/) | KDE Plasma Desktop | 3 | Adjusts Kickoff and Folder View behavior and scrolls overflowing Task Manager labels on hover. |
+| [`wine-tkg/`](wine-tkg/) | Wine-tkg | 3 | Adds portal-backed file dialogs and Wine Wayland server-side decorations. |
+| [`kpipewire/`](kpipewire/) | KPipewire | 1 | Fixes a bug where KDE's task thumbnails on the taskbar would not work by raising a buffer. |
 
 ## Using the files
 
