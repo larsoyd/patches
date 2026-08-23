@@ -1,4 +1,4 @@
-From: Movie Maker Wine investigation <wine-tkg@localhost>
+From: Lars Slettan Øydneskleiv <larsoyd@github.com>
 Date: Sun, 24 Aug 2026 00:00:00 +0200
 Subject: [PATCH] ntdll: Implement MUI satellite resource redirection.
 
