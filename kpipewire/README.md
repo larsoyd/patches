@@ -1,3 +1,7 @@
+## Patches
+
+### `increase-pipewire-format-buffer.patch`
+
 TL;DR: KDE Plasma task thumbnails would randomly stop working. I found out that KPipeWire was trying to serialize a variable-sized list of video capabilities into a fixed 4096-byte buffer but on my system, the complete list required about 4896 bytes. The randomness came from how   those capabilities were being stored, which was by using a QHash. Because a QHash does not have a fixed order, their iteration order could change with Plasma's process hash seed. Meaning exactly two formats were always being lost, but which two changed from one Plasma process to another. 
 
 So to fix this my patch simply raises the buffer by 3 times from 4096 to 16384.
