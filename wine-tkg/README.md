@@ -37,6 +37,24 @@ failure (a generic "Call failed." E_FAIL dialog) traced back to exactly
 this gap. Confirmed fixed both via a minimal winegcc harness and against
 the real application, which now reaches its normal main window.
 
+### `0013-wmvcore-implement-loadprofilebydata-profile-xml-par.mypatch`
+
+Implements `IWMProfileManager::LoadProfileByData` in `dlls/wmvcore` — a
+complete `E_NOTIMPL` stub previously — by parsing the Windows Media
+profile-XML schema (via xmllite) into a real, working `IWMProfile3`/
+`IWMStreamConfig`/`IWMMediaProps` object graph (new `dlls/wmvcore/profile.c`).
+Found and confirmed via Windows Movie Maker 6.0's bug #3: its own
+`CWMTProfileManager::CreateProfileFromData` detects the stub's `E_NOTIMPL`
+but (a latent app-side bug never exercised on real Windows) synthesizes a
+soft `S_FALSE`/NULL instead of propagating it, and its caller three frames
+up dereferences the NULL profile pointer without checking it — a crash a
+few seconds into the app's post-startup idle-loop initialization. Confirmed
+fixed both via `harness/wmprofile-loadbydata/` (fails with `E_NOTIMPL` against
+the unpatched stub, passes with correct stream/media-type field values
+against this patch) and against the real application, whose main window
+now survives well past the former crash point with zero `wmvcore` fixme
+lines across all 31 bundled profiles.
+
 ## Applying
 
 Use the files as wine-tkg custom patches, retaining their numeric order. They
@@ -47,7 +65,9 @@ git apply /path/to/patches/wine-tkg/0006-comdlg32-use-XDG-Desktop-Portal-for-nat
 git apply /path/to/patches/wine-tkg/0007-comdlg32-fix-portal-dialog-compatibility-and-respons.mypatch
 git apply /path/to/patches/wine-tkg/0011-winewayland-server-side-decorations.mypatch
 git apply /path/to/patches/wine-tkg/0012-ntdll-implement-mui-satellite-resource-redirection.mypatch
+git apply /path/to/patches/wine-tkg/0013-wmvcore-implement-loadprofilebydata-profile-xml-par.mypatch
 ```
 
-Patch 0007 depends on patch 0006. The server-side decoration patch and the MUI
-resource redirection patch are each independent of the rest of the series.
+Patch 0007 depends on patch 0006. The server-side decoration patch, the MUI
+resource redirection patch, and the wmvcore profile-XML patch are each
+independent of the rest of the series.

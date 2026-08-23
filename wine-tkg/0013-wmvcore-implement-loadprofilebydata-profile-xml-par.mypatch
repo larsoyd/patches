@@ -1,0 +1,1523 @@
+From: Lars Slettan Øydneskleiv <larsoyd@github.com>
+Date: Mon, 24 Aug 2026 00:00:00 +0200
+Subject: [PATCH] wmvcore: Implement IWMProfileManager::LoadProfileByData.
+
+IWMProfileManager::LoadProfileByData is a fully-specified Windows Media
+Format SDK API: given the profile-XML text format used throughout WMSDK
+(the same schema Windows Movie Maker embeds as PE resources for its own
+default capture/preview profiles, and the same schema its on-disk
+exported .prx profile files use), it parses it and returns a working
+IWMProfile object exposing the parsed streams' types, bitrates, buffer
+windows, names and full WM_MEDIA_TYPE (WAVEFORMATEX / VIDEOINFOHEADER +
+BITMAPINFOHEADER) media types.
+
+Wine's implementation was a complete stub - FIXME(...); return
+E_NOTIMPL; - never touching its IWMProfile** out-parameter. This is
+directly observable as a real-world compatibility bug, not just a
+missing conformance detail: Windows Movie Maker 6.0's own
+CWMTProfileManager::CreateProfileFromData wrapper detects the E_NOTIMPL
+failure but (a defensive-code bug of its own, never exercised against
+genuine Windows, where this call does not fail for the application's
+own bundled, known-good profiles) returns S_FALSE instead of
+propagating a real failure code, leaving its own out-parameter NULL.
+Its caller three frames up, CWMTProfileManager::LoadApplicationProfiles,
+never NULL-checks the resulting pointer before dereferencing it, and
+crashes - during the application's post-startup idle-loop
+initialization, a few seconds after its main window has already
+rendered successfully.
+
+This implements profile-XML parsing end to end in a new
+dlls/wmvcore/profile.c:
+
+ - wm_profile_create_from_xml() wraps the caller's in-memory profile
+   text in an IStream (via CreateStreamOnHGlobal, the same pattern
+   dlls/taskschd/task.c already uses for its own in-memory task-XML
+   strings) and drives it through xmllite's real, already-tested
+   IXmlReader (dlls/xmllite) with a small explicit element-context
+   stack - the schema (<profile>, <streamconfig>, <wmmediatype>,
+   <waveformatex>, <videomediaprops>, <videoinfoheader>, <rcsource>,
+   <rctarget>, <bitmapinfoheader>, <dataunitextension>,
+   <streamprioritization>, <stream>) is a small closed set of flat
+   attribute bags nested at most four levels deep, confirmed by
+   extracting and inspecting all 31 RT_PRX profile resources a real
+   Windows Movie Maker 6.0 install embeds, so no general-purpose
+   tree/DOM handling is needed.
+ - GUID-valued attributes (majortype/subtype) are parsed via
+   CLSIDFromString, already available through combase, rather than a
+   hand-rolled GUID parser or a hardcoded subtype table.
+ - A new struct wm_profile (IWMProfile3) and struct wm_profile_stream
+   (IWMStreamConfig + IWMMediaProps, the same interface-splitting COM
+   idiom dlls/winegstreamer/wm_reader.c's struct stream_config already
+   uses) implement the profile/stream object graph. Unlike wm_reader.c's
+   read-only reflection of an already-open GStreamer-demuxed stream,
+   these are self-contained, freely settable objects built straight
+   from the parsed attributes - real GetStreamCount/GetStream/
+   GetStreamByNumber, and real IWMStreamConfig/IWMMediaProps get/set
+   pairs for stream type, number, name, connection name, bitrate,
+   buffer window and full media type. Methods with no bearing on this
+   codepath (CreateNewStream/AddStream/RemoveStream/mutual-exclusion/
+   stream-prioritization/storage-format/profile-ID) are left as the same
+   FIXME()+E_NOTIMPL stub pattern already used throughout this DLL.
+
+Confirmed against a real-fault harness (harness/wmprofile-loadbydata/ in
+the Movie Maker Wine investigation tree) that drives the exact same
+LoadProfileByData call path with a small, self-authored profile-XML
+string covering the full schema above (one audio stream, one video
+stream, a dataunitextension and a streamprioritization block, and an
+entity-escaped description to exercise xmllite's entity decoding):
+fails with E_NOTIMPL against the unpatched stub, passes - correct
+stream count, stream types, bitrates, buffer windows, and correctly
+round-tripped WAVEFORMATEX/VIDEOINFOHEADER/BITMAPINFOHEADER field
+values and entity-decoded description - with this patch applied. Also
+confirmed against the real Windows Movie Maker 6.0 application: with
+this patch, the main window survives well past the point
+CWMTProfileManager::LoadApplicationProfiles previously crashed
+(moviemk+0x404722, a NULL-pointer dereference a few seconds into the
+app's post-startup idle-loop initialization), and a full err/fixme
+trace of the process shows zero wmvcore fixme lines and zero
+unhandled-exception markers across all 31 of the application's bundled
+default profiles.
+---
+diff --git a/dlls/wmvcore/Makefile.in b/dlls/wmvcore/Makefile.in
+index bf9d47c986b..72eb7e92c1c 100644
+--- a/dlls/wmvcore/Makefile.in
++++ b/dlls/wmvcore/Makefile.in
+@@ -1,6 +1,6 @@
+ MODULE    = wmvcore.dll
+ IMPORTLIB = wmvcore
+-IMPORTS   = kernel32 combase
++IMPORTS   = kernel32 combase xmllite
+ DELAYIMPORTS = winegstreamer
+ 
+ VER_FILEDESCRIPTION_STR = "Wine Media Playback dll"
+@@ -8,5 +8,6 @@ VER_PRODUCTVERSION      = 12,0,7601,17514
+ 
+ SOURCES = \
+ 	async_reader.c \
++	profile.c \
+ 	wmvcore_main.c \
+ 	writer.c
+diff --git a/dlls/wmvcore/profile.c b/dlls/wmvcore/profile.c
+new file mode 100644
+index 00000000000..87a2f24633a
+--- /dev/null
++++ b/dlls/wmvcore/profile.c
+@@ -0,0 +1,1390 @@
++/*
++ * Copyright 2026 Lars Slettan Øydneskleiv <larsoyd@github.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stddef.h>
++#include <stdbool.h>
++#include <stdlib.h>
++#include <string.h>
++#include <wchar.h>
++
++#define COBJMACROS
++#include "windef.h"
++#include "winbase.h"
++#include "wingdi.h"
++#include "objbase.h"
++#include "mmreg.h"
++#include "strmif.h"
++#include "amvideo.h"
++
++#include "wmvcore_private.h"
++#include "wmsdk.h"
++
++/* Pulled in after wmsdk.h (and without INITGUID active while wmsdk.h is processed) so that
++ * wmsdkidl.h's DEFINE_GUID(IID_IWMProfile3, ...) etc. stay plain extern declarations here --
++ * async_reader.c is already the one file in this DLL that defines those. IID_IXmlReader is
++ * not defined anywhere else in wmvcore, so this is the one file that owns its definition. */
++#include "initguid.h"
++#include "xmllite.h"
++
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(wmvcore);
++
++/* Format-type GUIDs. Not present in the profile-XML data itself -- implied by which child
++ * element (waveformatex vs videoinfoheader) appears -- so defined locally instead of pulling
++ * in the whole INITGUID-guarded uuids.h just for two well-known constants. */
++static const GUID wm_FORMAT_WaveFormatEx =
++    {0x05589f81, 0xc356, 0x11ce, {0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a}};
++static const GUID wm_FORMAT_VideoInfo =
++    {0x05589f80, 0xc356, 0x11ce, {0xbf, 0x01, 0x00, 0xaa, 0x00, 0x55, 0x59, 0x5a}};
++
++struct wm_profile_stream
++{
++    IWMStreamConfig IWMStreamConfig_iface;
++    IWMMediaProps IWMMediaProps_iface;
++    LONG refcount;
++
++    WORD stream_number;
++    GUID major_type;
++    WCHAR *stream_name;
++    WCHAR *connection_name;
++    DWORD bitrate;
++    DWORD buffer_window;
++
++    WM_MEDIA_TYPE mt;   /* mt.pbFormat is owned via CoTaskMemAlloc */
++};
++
++struct wm_profile
++{
++    IWMProfile3 IWMProfile3_iface;
++    LONG refcount;
++
++    WCHAR *name;
++    WCHAR *description;
++    DWORD version;
++    DWORD storage_format;
++
++    struct wm_profile_stream **streams;
++    DWORD stream_count;
++};
++
++/* ------------------------------------------------------------------------------------------
++ * small helpers
++ * ------------------------------------------------------------------------------------------ */
++
++static WCHAR *wm_strdupW(const WCHAR *s)
++{
++    WCHAR *ret;
++    size_t len;
++
++    if (!s)
++        return NULL;
++
++    len = (wcslen(s) + 1) * sizeof(WCHAR);
++    if (!(ret = malloc(len)))
++        return NULL;
++    memcpy(ret, s, len);
++    return ret;
++}
++
++static DWORD wm_parse_dword(const WCHAR *value)
++{
++    return value ? wcstoul(value, NULL, 10) : 0;
++}
++
++static LONGLONG wm_parse_qword(const WCHAR *value)
++{
++    return value ? wcstoll(value, NULL, 10) : 0;
++}
++
++static BOOL wm_parse_bool(const WCHAR *value)
++{
++    return value && wm_parse_dword(value) != 0;
++}
++
++static int hex_nibble(WCHAR c)
++{
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++    return -1;
++}
++
++/* Decodes an even-length hex-digit string (e.g. "008800000F0059550000") into raw bytes.
++ * Returns the byte count via *len_out; NULL/zero-length input yields a zero-length result. */
++static BYTE *wm_decode_hex(const WCHAR *value, DWORD *len_out)
++{
++    size_t char_len = value ? wcslen(value) : 0;
++    DWORD len = char_len / 2;
++    BYTE *buf;
++    DWORD i;
++
++    *len_out = 0;
++    if (!len)
++        return NULL;
++    if (!(buf = malloc(len)))
++        return NULL;
++
++    for (i = 0; i < len; ++i)
++    {
++        int hi = hex_nibble(value[i * 2]);
++        int lo = hex_nibble(value[i * 2 + 1]);
++        if (hi < 0 || lo < 0)
++        {
++            free(buf);
++            *len_out = 0;
++            return NULL;
++        }
++        buf[i] = (BYTE)((hi << 4) | lo);
++    }
++
++    *len_out = len;
++    return buf;
++}
++
++static DWORD wm_fourcc_from_string(const WCHAR *value)
++{
++    BYTE b[4] = {' ', ' ', ' ', ' '};
++    size_t len = value ? wcslen(value) : 0;
++    unsigned int i;
++
++    for (i = 0; i < 4 && i < len; ++i)
++        b[i] = (BYTE)value[i];
++
++    return (DWORD)b[0] | ((DWORD)b[1] << 8) | ((DWORD)b[2] << 16) | ((DWORD)b[3] << 24);
++}
++
++static void wm_media_type_free(WM_MEDIA_TYPE *mt)
++{
++    CoTaskMemFree(mt->pbFormat);
++    memset(mt, 0, sizeof(*mt));
++}
++
++static HRESULT wm_media_type_copy(WM_MEDIA_TYPE *dst, const WM_MEDIA_TYPE *src)
++{
++    BYTE *format = NULL;
++
++    if (src->cbFormat && !(format = CoTaskMemAlloc(src->cbFormat)))
++        return E_OUTOFMEMORY;
++    if (src->cbFormat)
++        memcpy(format, src->pbFormat, src->cbFormat);
++
++    wm_media_type_free(dst);
++    *dst = *src;
++    dst->pbFormat = format;
++    dst->pUnk = NULL;
++    return S_OK;
++}
++
++/* ------------------------------------------------------------------------------------------
++ * IWMStreamConfig / IWMMediaProps  (struct wm_profile_stream)
++ * ------------------------------------------------------------------------------------------ */
++
++static struct wm_profile_stream *impl_from_IWMStreamConfig(IWMStreamConfig *iface)
++{
++    return CONTAINING_RECORD(iface, struct wm_profile_stream, IWMStreamConfig_iface);
++}
++
++static struct wm_profile_stream *impl_from_IWMMediaProps(IWMMediaProps *iface)
++{
++    return CONTAINING_RECORD(iface, struct wm_profile_stream, IWMMediaProps_iface);
++}
++
++static void wm_profile_stream_destroy(struct wm_profile_stream *stream)
++{
++    wm_media_type_free(&stream->mt);
++    free(stream->stream_name);
++    free(stream->connection_name);
++    free(stream);
++}
++
++static HRESULT WINAPI stream_config_QueryInterface(IWMStreamConfig *iface, REFIID iid, void **out)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, iid %s, out %p.\n", stream, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IWMStreamConfig))
++        *out = &stream->IWMStreamConfig_iface;
++    else if (IsEqualGUID(iid, &IID_IWMMediaProps))
++        *out = &stream->IWMMediaProps_iface;
++    else
++    {
++        *out = NULL;
++        WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        return E_NOINTERFACE;
++    }
++
++    IUnknown_AddRef((IUnknown *)*out);
++    return S_OK;
++}
++
++static ULONG WINAPI stream_config_AddRef(IWMStreamConfig *iface)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++    ULONG refcount = InterlockedIncrement(&stream->refcount);
++
++    TRACE("%p increasing refcount to %lu.\n", stream, refcount);
++    return refcount;
++}
++
++static ULONG WINAPI stream_config_Release(IWMStreamConfig *iface)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++    ULONG refcount = InterlockedDecrement(&stream->refcount);
++
++    TRACE("%p decreasing refcount to %lu.\n", stream, refcount);
++    if (!refcount)
++        wm_profile_stream_destroy(stream);
++    return refcount;
++}
++
++static HRESULT WINAPI stream_config_GetStreamType(IWMStreamConfig *iface, GUID *type)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, type %p.\n", stream, type);
++    *type = stream->major_type;
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_config_GetStreamNumber(IWMStreamConfig *iface, WORD *number)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, number %p.\n", stream, number);
++    *number = stream->stream_number;
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_config_SetStreamNumber(IWMStreamConfig *iface, WORD number)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, number %u.\n", stream, number);
++    stream->stream_number = number;
++    return S_OK;
++}
++
++static HRESULT wm_get_string(const WCHAR *src, WCHAR *out, WORD *len)
++{
++    DWORD required = (src ? (DWORD)wcslen(src) : 0) + 1;
++
++    if (!out || *len < required)
++    {
++        *len = required;
++        return ASF_E_BUFFERTOOSMALL;
++    }
++
++    if (src)
++        memcpy(out, src, required * sizeof(WCHAR));
++    else
++        out[0] = 0;
++    *len = required;
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_config_GetStreamName(IWMStreamConfig *iface, WCHAR *name, WORD *len)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, name %p, len %p.\n", stream, name, len);
++    return wm_get_string(stream->stream_name, name, len);
++}
++
++static HRESULT WINAPI stream_config_SetStreamName(IWMStreamConfig *iface, const WCHAR *name)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++    WCHAR *copy;
++
++    TRACE("stream %p, name %s.\n", stream, debugstr_w(name));
++
++    if (name && !(copy = wm_strdupW(name)))
++        return E_OUTOFMEMORY;
++    else if (!name)
++        copy = NULL;
++
++    free(stream->stream_name);
++    stream->stream_name = copy;
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_config_GetConnectionName(IWMStreamConfig *iface, WCHAR *name, WORD *len)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, name %p, len %p.\n", stream, name, len);
++    return wm_get_string(stream->connection_name, name, len);
++}
++
++static HRESULT WINAPI stream_config_SetConnectionName(IWMStreamConfig *iface, const WCHAR *name)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++    WCHAR *copy;
++
++    TRACE("stream %p, name %s.\n", stream, debugstr_w(name));
++
++    if (name && !(copy = wm_strdupW(name)))
++        return E_OUTOFMEMORY;
++    else if (!name)
++        copy = NULL;
++
++    free(stream->connection_name);
++    stream->connection_name = copy;
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_config_GetBitrate(IWMStreamConfig *iface, DWORD *bitrate)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, bitrate %p.\n", stream, bitrate);
++    *bitrate = stream->bitrate;
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_config_SetBitrate(IWMStreamConfig *iface, DWORD bitrate)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, bitrate %lu.\n", stream, bitrate);
++    stream->bitrate = bitrate;
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_config_GetBufferWindow(IWMStreamConfig *iface, DWORD *window)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, window %p.\n", stream, window);
++    *window = stream->buffer_window;
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_config_SetBufferWindow(IWMStreamConfig *iface, DWORD window)
++{
++    struct wm_profile_stream *stream = impl_from_IWMStreamConfig(iface);
++
++    TRACE("stream %p, window %lu.\n", stream, window);
++    stream->buffer_window = window;
++    return S_OK;
++}
++
++static const IWMStreamConfigVtbl stream_config_vtbl =
++{
++    stream_config_QueryInterface,
++    stream_config_AddRef,
++    stream_config_Release,
++    stream_config_GetStreamType,
++    stream_config_GetStreamNumber,
++    stream_config_SetStreamNumber,
++    stream_config_GetStreamName,
++    stream_config_SetStreamName,
++    stream_config_GetConnectionName,
++    stream_config_SetConnectionName,
++    stream_config_GetBitrate,
++    stream_config_SetBitrate,
++    stream_config_GetBufferWindow,
++    stream_config_SetBufferWindow,
++};
++
++static HRESULT WINAPI stream_props_QueryInterface(IWMMediaProps *iface, REFIID iid, void **out)
++{
++    struct wm_profile_stream *stream = impl_from_IWMMediaProps(iface);
++    return IWMStreamConfig_QueryInterface(&stream->IWMStreamConfig_iface, iid, out);
++}
++
++static ULONG WINAPI stream_props_AddRef(IWMMediaProps *iface)
++{
++    struct wm_profile_stream *stream = impl_from_IWMMediaProps(iface);
++    return IWMStreamConfig_AddRef(&stream->IWMStreamConfig_iface);
++}
++
++static ULONG WINAPI stream_props_Release(IWMMediaProps *iface)
++{
++    struct wm_profile_stream *stream = impl_from_IWMMediaProps(iface);
++    return IWMStreamConfig_Release(&stream->IWMStreamConfig_iface);
++}
++
++static HRESULT WINAPI stream_props_GetType(IWMMediaProps *iface, GUID *major_type)
++{
++    struct wm_profile_stream *stream = impl_from_IWMMediaProps(iface);
++
++    TRACE("stream %p, major_type %p.\n", stream, major_type);
++    *major_type = stream->major_type;
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_props_GetMediaType(IWMMediaProps *iface, WM_MEDIA_TYPE *mt, DWORD *size)
++{
++    struct wm_profile_stream *stream = impl_from_IWMMediaProps(iface);
++    DWORD required = sizeof(*mt) + stream->mt.cbFormat;
++    DWORD req_size = *size;
++
++    TRACE("stream %p, mt %p, size %p.\n", stream, mt, size);
++
++    *size = required;
++    if (mt && req_size >= required)
++    {
++        memcpy(mt, &stream->mt, sizeof(*mt));
++        if (stream->mt.cbFormat)
++            memcpy(mt + 1, stream->mt.pbFormat, stream->mt.cbFormat);
++        mt->pbFormat = (BYTE *)(mt + 1);
++        mt->pUnk = NULL;
++    }
++    else if (mt)
++        return ASF_E_BUFFERTOOSMALL;
++
++    return S_OK;
++}
++
++static HRESULT WINAPI stream_props_SetMediaType(IWMMediaProps *iface, WM_MEDIA_TYPE *mt)
++{
++    struct wm_profile_stream *stream = impl_from_IWMMediaProps(iface);
++
++    TRACE("stream %p, mt %p.\n", stream, mt);
++
++    if (!mt)
++        return E_INVALIDARG;
++
++    stream->major_type = mt->majortype;
++    return wm_media_type_copy(&stream->mt, mt);
++}
++
++static const IWMMediaPropsVtbl stream_props_vtbl =
++{
++    stream_props_QueryInterface,
++    stream_props_AddRef,
++    stream_props_Release,
++    stream_props_GetType,
++    stream_props_GetMediaType,
++    stream_props_SetMediaType,
++};
++
++/* ------------------------------------------------------------------------------------------
++ * IWMProfile3  (struct wm_profile)
++ * ------------------------------------------------------------------------------------------ */
++
++static struct wm_profile *impl_from_IWMProfile3(IWMProfile3 *iface)
++{
++    return CONTAINING_RECORD(iface, struct wm_profile, IWMProfile3_iface);
++}
++
++static void wm_profile_destroy(struct wm_profile *profile)
++{
++    DWORD i;
++
++    for (i = 0; i < profile->stream_count; ++i)
++        IWMStreamConfig_Release(&profile->streams[i]->IWMStreamConfig_iface);
++    free(profile->streams);
++    free(profile->name);
++    free(profile->description);
++    free(profile);
++}
++
++static HRESULT WINAPI profile_QueryInterface(IWMProfile3 *iface, REFIID iid, void **out)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++
++    TRACE("profile %p, iid %s, out %p.\n", profile, debugstr_guid(iid), out);
++
++    if (IsEqualGUID(iid, &IID_IUnknown) || IsEqualGUID(iid, &IID_IWMProfile)
++            || IsEqualGUID(iid, &IID_IWMProfile2) || IsEqualGUID(iid, &IID_IWMProfile3))
++        *out = &profile->IWMProfile3_iface;
++    else
++    {
++        *out = NULL;
++        WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid));
++        return E_NOINTERFACE;
++    }
++
++    IUnknown_AddRef((IUnknown *)*out);
++    return S_OK;
++}
++
++static ULONG WINAPI profile_AddRef(IWMProfile3 *iface)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++    ULONG refcount = InterlockedIncrement(&profile->refcount);
++
++    TRACE("%p increasing refcount to %lu.\n", profile, refcount);
++    return refcount;
++}
++
++static ULONG WINAPI profile_Release(IWMProfile3 *iface)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++    ULONG refcount = InterlockedDecrement(&profile->refcount);
++
++    TRACE("%p decreasing refcount to %lu.\n", profile, refcount);
++    if (!refcount)
++        wm_profile_destroy(profile);
++    return refcount;
++}
++
++static HRESULT WINAPI profile_GetVersion(IWMProfile3 *iface, WMT_VERSION *version)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++
++    TRACE("profile %p, version %p.\n", profile, version);
++    *version = profile->version;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_GetName(IWMProfile3 *iface, WCHAR *name, DWORD *length)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++    DWORD required = (profile->name ? (DWORD)wcslen(profile->name) : 0) + 1;
++
++    TRACE("profile %p, name %p, length %p.\n", profile, name, length);
++
++    if (!name || *length < required)
++    {
++        *length = required;
++        return ASF_E_BUFFERTOOSMALL;
++    }
++    memcpy(name, profile->name ? profile->name : L"", required * sizeof(WCHAR));
++    *length = required;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_SetName(IWMProfile3 *iface, const WCHAR *name)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++    WCHAR *copy;
++
++    TRACE("profile %p, name %s.\n", profile, debugstr_w(name));
++
++    if (name && !(copy = wm_strdupW(name)))
++        return E_OUTOFMEMORY;
++    else if (!name)
++        copy = NULL;
++
++    free(profile->name);
++    profile->name = copy;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_GetDescription(IWMProfile3 *iface, WCHAR *description, DWORD *length)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++    DWORD required = (profile->description ? (DWORD)wcslen(profile->description) : 0) + 1;
++
++    TRACE("profile %p, description %p, length %p.\n", profile, description, length);
++
++    if (!description || *length < required)
++    {
++        *length = required;
++        return ASF_E_BUFFERTOOSMALL;
++    }
++    memcpy(description, profile->description ? profile->description : L"", required * sizeof(WCHAR));
++    *length = required;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_SetDescription(IWMProfile3 *iface, const WCHAR *description)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++    WCHAR *copy;
++
++    TRACE("profile %p, description %s.\n", profile, debugstr_w(description));
++
++    if (description && !(copy = wm_strdupW(description)))
++        return E_OUTOFMEMORY;
++    else if (!description)
++        copy = NULL;
++
++    free(profile->description);
++    profile->description = copy;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_GetStreamCount(IWMProfile3 *iface, DWORD *count)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++
++    TRACE("profile %p, count %p.\n", profile, count);
++    if (!count)
++        return E_INVALIDARG;
++    *count = profile->stream_count;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_GetStream(IWMProfile3 *iface, DWORD index, IWMStreamConfig **config)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++
++    TRACE("profile %p, index %lu, config %p.\n", profile, index, config);
++
++    if (index >= profile->stream_count)
++    {
++        WARN("Index %lu exceeds stream count %lu.\n", index, profile->stream_count);
++        return E_INVALIDARG;
++    }
++
++    IWMStreamConfig_AddRef(&profile->streams[index]->IWMStreamConfig_iface);
++    *config = &profile->streams[index]->IWMStreamConfig_iface;
++    return S_OK;
++}
++
++static HRESULT WINAPI profile_GetStreamByNumber(IWMProfile3 *iface, WORD stream_number, IWMStreamConfig **config)
++{
++    struct wm_profile *profile = impl_from_IWMProfile3(iface);
++    DWORD i;
++
++    TRACE("profile %p, stream_number %u, config %p.\n", profile, stream_number, config);
++
++    for (i = 0; i < profile->stream_count; ++i)
++    {
++        if (profile->streams[i]->stream_number == stream_number)
++        {
++            IWMStreamConfig_AddRef(&profile->streams[i]->IWMStreamConfig_iface);
++            *config = &profile->streams[i]->IWMStreamConfig_iface;
++            return S_OK;
++        }
++    }
++
++    return NS_E_NO_STREAM;
++}
++
++static HRESULT WINAPI profile_RemoveStream(IWMProfile3 *iface, IWMStreamConfig *config)
++{
++    FIXME("iface %p, config %p, stub!\n", iface, config);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_RemoveStreamByNumber(IWMProfile3 *iface, WORD stream_number)
++{
++    FIXME("iface %p, stream_number %u, stub!\n", iface, stream_number);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_AddStream(IWMProfile3 *iface, IWMStreamConfig *config)
++{
++    FIXME("iface %p, config %p, stub!\n", iface, config);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_ReconfigStream(IWMProfile3 *iface, IWMStreamConfig *config)
++{
++    FIXME("iface %p, config %p, stub!\n", iface, config);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_CreateNewStream(IWMProfile3 *iface, REFGUID type, IWMStreamConfig **config)
++{
++    FIXME("iface %p, type %s, config %p, stub!\n", iface, debugstr_guid(type), config);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_GetMutualExclusionCount(IWMProfile3 *iface, DWORD *count)
++{
++    FIXME("iface %p, count %p, stub!\n", iface, count);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_GetMutualExclusion(IWMProfile3 *iface, DWORD index, IWMMutualExclusion **excl)
++{
++    FIXME("iface %p, index %lu, excl %p, stub!\n", iface, index, excl);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_RemoveMutualExclusion(IWMProfile3 *iface, IWMMutualExclusion *excl)
++{
++    FIXME("iface %p, excl %p, stub!\n", iface, excl);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_AddMutualExclusion(IWMProfile3 *iface, IWMMutualExclusion *excl)
++{
++    FIXME("iface %p, excl %p, stub!\n", iface, excl);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_CreateNewMutualExclusion(IWMProfile3 *iface, IWMMutualExclusion **excl)
++{
++    FIXME("iface %p, excl %p, stub!\n", iface, excl);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_GetProfileID(IWMProfile3 *iface, GUID *id)
++{
++    FIXME("iface %p, id %p, stub!\n", iface, id);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_GetStorageFormat(IWMProfile3 *iface, WMT_STORAGE_FORMAT *format)
++{
++    FIXME("iface %p, format %p, stub!\n", iface, format);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_SetStorageFormat(IWMProfile3 *iface, WMT_STORAGE_FORMAT format)
++{
++    FIXME("iface %p, format %#x, stub!\n", iface, format);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_GetBandwidthSharingCount(IWMProfile3 *iface, DWORD *count)
++{
++    FIXME("iface %p, count %p, stub!\n", iface, count);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_GetBandwidthSharing(IWMProfile3 *iface, DWORD index, IWMBandwidthSharing **sharing)
++{
++    FIXME("iface %p, index %lu, sharing %p, stub!\n", iface, index, sharing);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_RemoveBandwidthSharing(IWMProfile3 *iface, IWMBandwidthSharing *sharing)
++{
++    FIXME("iface %p, sharing %p, stub!\n", iface, sharing);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_AddBandwidthSharing(IWMProfile3 *iface, IWMBandwidthSharing *sharing)
++{
++    FIXME("iface %p, sharing %p, stub!\n", iface, sharing);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_CreateNewBandwidthSharing(IWMProfile3 *iface, IWMBandwidthSharing **sharing)
++{
++    FIXME("iface %p, sharing %p, stub!\n", iface, sharing);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_GetStreamPrioritization(IWMProfile3 *iface, IWMStreamPrioritization **stream)
++{
++    FIXME("iface %p, stream %p, stub!\n", iface, stream);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_SetStreamPrioritization(IWMProfile3 *iface, IWMStreamPrioritization *stream)
++{
++    FIXME("iface %p, stream %p, stub!\n", iface, stream);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_RemoveStreamPrioritization(IWMProfile3 *iface)
++{
++    FIXME("iface %p, stub!\n", iface);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_CreateNewStreamPrioritization(IWMProfile3 *iface, IWMStreamPrioritization **stream)
++{
++    FIXME("iface %p, stream %p, stub!\n", iface, stream);
++    return E_NOTIMPL;
++}
++
++static HRESULT WINAPI profile_GetExpectedPacketCount(IWMProfile3 *iface, QWORD duration, QWORD *count)
++{
++    FIXME("iface %p, duration %s, count %p, stub!\n", iface, wine_dbgstr_longlong(duration), count);
++    return E_NOTIMPL;
++}
++
++static const IWMProfile3Vtbl profile_vtbl =
++{
++    profile_QueryInterface,
++    profile_AddRef,
++    profile_Release,
++    profile_GetVersion,
++    profile_GetName,
++    profile_SetName,
++    profile_GetDescription,
++    profile_SetDescription,
++    profile_GetStreamCount,
++    profile_GetStream,
++    profile_GetStreamByNumber,
++    profile_RemoveStream,
++    profile_RemoveStreamByNumber,
++    profile_AddStream,
++    profile_ReconfigStream,
++    profile_CreateNewStream,
++    profile_GetMutualExclusionCount,
++    profile_GetMutualExclusion,
++    profile_RemoveMutualExclusion,
++    profile_AddMutualExclusion,
++    profile_CreateNewMutualExclusion,
++    profile_GetProfileID,
++    profile_GetStorageFormat,
++    profile_SetStorageFormat,
++    profile_GetBandwidthSharingCount,
++    profile_GetBandwidthSharing,
++    profile_RemoveBandwidthSharing,
++    profile_AddBandwidthSharing,
++    profile_CreateNewBandwidthSharing,
++    profile_GetStreamPrioritization,
++    profile_SetStreamPrioritization,
++    profile_RemoveStreamPrioritization,
++    profile_CreateNewStreamPrioritization,
++    profile_GetExpectedPacketCount,
++};
++
++/* ------------------------------------------------------------------------------------------
++ * profile-XML parsing
++ *
++ * Schema is a small closed set (confirmed by extracting and inspecting all 31 RT_PRX
++ * resources Windows Movie Maker 6.0 embeds in MOVIEMK.dll): <profile>, <streamconfig>,
++ * <wmmediatype>, <waveformatex>, <videomediaprops>, <videoinfoheader>, <rcsource>,
++ * <rctarget>, <bitmapinfoheader>, <dataunitextension>, <streamprioritization>, <stream>.
++ * All are flat attribute bags, nested at most 4 levels deep -- a small explicit context
++ * stack plus a scratch struct for the in-progress video format is enough; no general
++ * tree/DOM is needed.
++ * ------------------------------------------------------------------------------------------ */
++
++enum profile_ctx
++{
++    CTX_ROOT,
++    CTX_PROFILE,
++    CTX_STREAMCONFIG,
++    CTX_WMMEDIATYPE,
++    CTX_VIDEOINFOHEADER,
++    CTX_OTHER,          /* includes waveformatex/rcsource/rctarget/bitmapinfoheader/
++                          * videomediaprops/dataunitextension/streamprioritization/stream --
++                          * all handled entirely within handle_element_start(), nothing to
++                          * do when they close */
++};
++
++struct parse_ctx
++{
++    struct wm_profile *profile;
++    struct wm_profile_stream *cur_stream;   /* stream currently being parsed, or NULL */
++
++    /* scratch state while building the current stream's video format */
++    RECT rc_source, rc_target;
++    BITMAPINFOHEADER bmih;
++    DWORD vih_bitrate, vih_biterrorrate;
++    LONGLONG vih_avgtimeperframe;
++
++    enum profile_ctx stack[32];
++    int depth;
++};
++
++static HRESULT wm_profile_stream_create(struct wm_profile_stream **out)
++{
++    struct wm_profile_stream *stream;
++
++    if (!(stream = calloc(1, sizeof(*stream))))
++        return E_OUTOFMEMORY;
++    stream->IWMStreamConfig_iface.lpVtbl = &stream_config_vtbl;
++    stream->IWMMediaProps_iface.lpVtbl = &stream_props_vtbl;
++    stream->refcount = 1;
++    stream->buffer_window = -1;
++    *out = stream;
++    return S_OK;
++}
++
++static HRESULT wm_profile_add_stream(struct wm_profile *profile, struct wm_profile_stream *stream)
++{
++    struct wm_profile_stream **streams;
++
++    if (!(streams = realloc(profile->streams, (profile->stream_count + 1) * sizeof(*streams))))
++        return E_OUTOFMEMORY;
++    profile->streams = streams;
++    profile->streams[profile->stream_count++] = stream;
++    return S_OK;
++}
++
++static HRESULT wm_read_attributes_start(IXmlReader *reader, BOOL *has_attrs)
++{
++    HRESULT hr = IXmlReader_MoveToFirstAttribute(reader);
++    *has_attrs = (hr == S_OK);
++    return (hr == S_OK || hr == S_FALSE) ? S_OK : hr;
++}
++
++/* Parses attributes of the element the reader currently sits on (works whether that
++ * element is self-closing or not -- attributes are available on the Element node either
++ * way) and dispatches each (local name, value) pair to the caller-supplied handler. */
++typedef void (*attr_cb)(struct parse_ctx *ctx, const WCHAR *name, const WCHAR *value);
++
++static HRESULT wm_walk_attributes(IXmlReader *reader, struct parse_ctx *ctx, attr_cb cb)
++{
++    HRESULT hr;
++    BOOL has_attrs;
++
++    if (FAILED(hr = wm_read_attributes_start(reader, &has_attrs)))
++        return hr;
++
++    while (has_attrs)
++    {
++        const WCHAR *name, *value;
++
++        if (FAILED(hr = IXmlReader_GetLocalName(reader, &name, NULL)))
++            return hr;
++        if (FAILED(hr = IXmlReader_GetValue(reader, &value, NULL)))
++            return hr;
++
++        cb(ctx, name, value);
++
++        hr = IXmlReader_MoveToNextAttribute(reader);
++        if (FAILED(hr))
++            return hr;
++        has_attrs = (hr == S_OK);
++    }
++
++    return S_OK;
++}
++
++static void profile_attr(struct parse_ctx *ctx, const WCHAR *name, const WCHAR *value)
++{
++    struct wm_profile *profile = ctx->profile;
++
++    if (!wcscmp(name, L"version")) profile->version = wm_parse_dword(value);
++    else if (!wcscmp(name, L"storageformat")) profile->storage_format = wm_parse_dword(value);
++    else if (!wcscmp(name, L"name")) profile->name = wm_strdupW(value);
++    else if (!wcscmp(name, L"description")) profile->description = wm_strdupW(value);
++}
++
++static void streamconfig_attr(struct parse_ctx *ctx, const WCHAR *name, const WCHAR *value)
++{
++    struct wm_profile_stream *stream = ctx->cur_stream;
++
++    if (!wcscmp(name, L"majortype"))
++    {
++        GUID guid;
++        if (SUCCEEDED(CLSIDFromString(value, &guid)))
++        {
++            stream->major_type = guid;
++            stream->mt.majortype = guid;
++        }
++    }
++    else if (!wcscmp(name, L"streamnumber")) stream->stream_number = (WORD)wm_parse_dword(value);
++    else if (!wcscmp(name, L"streamname")) stream->stream_name = wm_strdupW(value);
++    else if (!wcscmp(name, L"bitrate")) stream->bitrate = wm_parse_dword(value);
++    else if (!wcscmp(name, L"bufferwindow")) stream->buffer_window = wm_parse_dword(value);
++    /* inputname, reliabletransport, decodercomplexity, rfc1766langid, vbrenabled,
++     * vbrquality, bitratemax, bufferwindowmax: read but intentionally not stored -- out
++     * of scope, see the implementation plan. */
++}
++
++static void wmmediatype_attr(struct parse_ctx *ctx, const WCHAR *name, const WCHAR *value)
++{
++    WM_MEDIA_TYPE *mt = &ctx->cur_stream->mt;
++
++    if (!wcscmp(name, L"subtype"))
++    {
++        GUID guid;
++        if (SUCCEEDED(CLSIDFromString(value, &guid)))
++            mt->subtype = guid;
++    }
++    else if (!wcscmp(name, L"bfixedsizesamples")) mt->bFixedSizeSamples = wm_parse_bool(value);
++    else if (!wcscmp(name, L"btemporalcompression")) mt->bTemporalCompression = wm_parse_bool(value);
++    else if (!wcscmp(name, L"lsamplesize")) mt->lSampleSize = wm_parse_dword(value);
++}
++
++struct wfx_scratch
++{
++    WORD format_tag, channels, block_align, bits_per_sample;
++    DWORD samples_per_sec, avg_bytes_per_sec;
++    BYTE *codec_data;
++    DWORD codec_data_len;
++};
++
++/* Handles the fully self-closing <waveformatex .../> element: collects its attributes and
++ * immediately builds+attaches the WAVEFORMATEX-backed WM_MEDIA_TYPE onto the current stream. */
++static HRESULT handle_waveformatex_element(IXmlReader *reader, struct parse_ctx *ctx)
++{
++    struct wfx_scratch s = {0};
++    WAVEFORMATEX *wfx;
++    HRESULT hr;
++    BOOL has_attrs;
++
++    if (FAILED(hr = wm_read_attributes_start(reader, &has_attrs)))
++        return hr;
++
++    while (has_attrs)
++    {
++        const WCHAR *name, *value;
++
++        if (FAILED(hr = IXmlReader_GetLocalName(reader, &name, NULL)))
++            return hr;
++        if (FAILED(hr = IXmlReader_GetValue(reader, &value, NULL)))
++            return hr;
++
++        if (!wcscmp(name, L"wFormatTag")) s.format_tag = (WORD)wm_parse_dword(value);
++        else if (!wcscmp(name, L"nChannels")) s.channels = (WORD)wm_parse_dword(value);
++        else if (!wcscmp(name, L"nSamplesPerSec")) s.samples_per_sec = wm_parse_dword(value);
++        else if (!wcscmp(name, L"nAvgBytesPerSec")) s.avg_bytes_per_sec = wm_parse_dword(value);
++        else if (!wcscmp(name, L"nBlockAlign")) s.block_align = (WORD)wm_parse_dword(value);
++        else if (!wcscmp(name, L"wBitsPerSample")) s.bits_per_sample = (WORD)wm_parse_dword(value);
++        else if (!wcscmp(name, L"codecdata"))
++        {
++            free(s.codec_data);
++            s.codec_data = wm_decode_hex(value, &s.codec_data_len);
++        }
++
++        hr = IXmlReader_MoveToNextAttribute(reader);
++        if (FAILED(hr)) { free(s.codec_data); return hr; }
++        has_attrs = (hr == S_OK);
++    }
++
++    if (!(wfx = CoTaskMemAlloc(sizeof(*wfx) + s.codec_data_len)))
++    {
++        free(s.codec_data);
++        return E_OUTOFMEMORY;
++    }
++    wfx->wFormatTag = s.format_tag;
++    wfx->nChannels = s.channels;
++    wfx->nSamplesPerSec = s.samples_per_sec;
++    wfx->nAvgBytesPerSec = s.avg_bytes_per_sec;
++    wfx->nBlockAlign = s.block_align;
++    wfx->wBitsPerSample = s.bits_per_sample;
++    wfx->cbSize = (WORD)s.codec_data_len;
++    if (s.codec_data_len)
++        memcpy(wfx + 1, s.codec_data, s.codec_data_len);
++    free(s.codec_data);
++
++    CoTaskMemFree(ctx->cur_stream->mt.pbFormat);
++    ctx->cur_stream->mt.formattype = wm_FORMAT_WaveFormatEx;
++    ctx->cur_stream->mt.cbFormat = sizeof(*wfx) + s.codec_data_len;
++    ctx->cur_stream->mt.pbFormat = (BYTE *)wfx;
++    return S_OK;
++}
++
++static HRESULT handle_rcsource_element(IXmlReader *reader, struct parse_ctx *ctx, RECT *rc)
++{
++    HRESULT hr;
++    BOOL has_attrs;
++
++    memset(rc, 0, sizeof(*rc));
++    if (FAILED(hr = wm_read_attributes_start(reader, &has_attrs)))
++        return hr;
++
++    while (has_attrs)
++    {
++        const WCHAR *name, *value;
++
++        if (FAILED(hr = IXmlReader_GetLocalName(reader, &name, NULL)))
++            return hr;
++        if (FAILED(hr = IXmlReader_GetValue(reader, &value, NULL)))
++            return hr;
++
++        if (!wcscmp(name, L"left")) rc->left = wm_parse_dword(value);
++        else if (!wcscmp(name, L"top")) rc->top = wm_parse_dword(value);
++        else if (!wcscmp(name, L"right")) rc->right = wm_parse_dword(value);
++        else if (!wcscmp(name, L"bottom")) rc->bottom = wm_parse_dword(value);
++
++        hr = IXmlReader_MoveToNextAttribute(reader);
++        if (FAILED(hr)) return hr;
++        has_attrs = (hr == S_OK);
++    }
++    return S_OK;
++}
++
++static HRESULT handle_bitmapinfoheader_element(IXmlReader *reader, BITMAPINFOHEADER *bmih)
++{
++    HRESULT hr;
++    BOOL has_attrs;
++
++    memset(bmih, 0, sizeof(*bmih));
++    bmih->biSize = sizeof(*bmih);
++    if (FAILED(hr = wm_read_attributes_start(reader, &has_attrs)))
++        return hr;
++
++    while (has_attrs)
++    {
++        const WCHAR *name, *value;
++
++        if (FAILED(hr = IXmlReader_GetLocalName(reader, &name, NULL)))
++            return hr;
++        if (FAILED(hr = IXmlReader_GetValue(reader, &value, NULL)))
++            return hr;
++
++        if (!wcscmp(name, L"biwidth")) bmih->biWidth = wm_parse_dword(value);
++        else if (!wcscmp(name, L"biheight")) bmih->biHeight = wm_parse_dword(value);
++        else if (!wcscmp(name, L"biplanes")) bmih->biPlanes = (WORD)wm_parse_dword(value);
++        else if (!wcscmp(name, L"bibitcount")) bmih->biBitCount = (WORD)wm_parse_dword(value);
++        else if (!wcscmp(name, L"bicompression")) bmih->biCompression = wm_fourcc_from_string(value);
++        else if (!wcscmp(name, L"bisizeimage")) bmih->biSizeImage = wm_parse_dword(value);
++        else if (!wcscmp(name, L"bixpelspermeter")) bmih->biXPelsPerMeter = wm_parse_dword(value);
++        else if (!wcscmp(name, L"biypelspermeter")) bmih->biYPelsPerMeter = wm_parse_dword(value);
++        else if (!wcscmp(name, L"biclrused")) bmih->biClrUsed = wm_parse_dword(value);
++        else if (!wcscmp(name, L"biclrimportant")) bmih->biClrImportant = wm_parse_dword(value);
++
++        hr = IXmlReader_MoveToNextAttribute(reader);
++        if (FAILED(hr)) return hr;
++        has_attrs = (hr == S_OK);
++    }
++    return S_OK;
++}
++
++static HRESULT handle_videoinfoheader_start(IXmlReader *reader, struct parse_ctx *ctx)
++{
++    HRESULT hr;
++    BOOL has_attrs;
++
++    ctx->vih_bitrate = ctx->vih_biterrorrate = 0;
++    ctx->vih_avgtimeperframe = 0;
++    memset(&ctx->rc_source, 0, sizeof(ctx->rc_source));
++    memset(&ctx->rc_target, 0, sizeof(ctx->rc_target));
++    memset(&ctx->bmih, 0, sizeof(ctx->bmih));
++
++    if (FAILED(hr = wm_read_attributes_start(reader, &has_attrs)))
++        return hr;
++
++    while (has_attrs)
++    {
++        const WCHAR *name, *value;
++
++        if (FAILED(hr = IXmlReader_GetLocalName(reader, &name, NULL)))
++            return hr;
++        if (FAILED(hr = IXmlReader_GetValue(reader, &value, NULL)))
++            return hr;
++
++        if (!wcscmp(name, L"dwbitrate")) ctx->vih_bitrate = wm_parse_dword(value);
++        else if (!wcscmp(name, L"dwbiterrorrate")) ctx->vih_biterrorrate = wm_parse_dword(value);
++        else if (!wcscmp(name, L"avgtimeperframe")) ctx->vih_avgtimeperframe = wm_parse_qword(value);
++
++        hr = IXmlReader_MoveToNextAttribute(reader);
++        if (FAILED(hr)) return hr;
++        has_attrs = (hr == S_OK);
++    }
++    return S_OK;
++}
++
++static HRESULT handle_videoinfoheader_end(struct parse_ctx *ctx)
++{
++    VIDEOINFOHEADER *vih;
++
++    if (!(vih = CoTaskMemAlloc(sizeof(*vih))))
++        return E_OUTOFMEMORY;
++
++    vih->rcSource = ctx->rc_source;
++    vih->rcTarget = ctx->rc_target;
++    vih->dwBitRate = ctx->vih_bitrate;
++    vih->dwBitErrorRate = ctx->vih_biterrorrate;
++    vih->AvgTimePerFrame = ctx->vih_avgtimeperframe;
++    vih->bmiHeader = ctx->bmih;
++
++    CoTaskMemFree(ctx->cur_stream->mt.pbFormat);
++    ctx->cur_stream->mt.formattype = wm_FORMAT_VideoInfo;
++    ctx->cur_stream->mt.cbFormat = sizeof(*vih);
++    ctx->cur_stream->mt.pbFormat = (BYTE *)vih;
++    return S_OK;
++}
++
++static HRESULT handle_element_start(IXmlReader *reader, struct parse_ctx *ctx,
++        enum profile_ctx parent, const WCHAR *name, enum profile_ctx *child_out)
++{
++    HRESULT hr = S_OK;
++
++    if (!wcscmp(name, L"profile"))
++    {
++        *child_out = CTX_PROFILE;
++        hr = wm_walk_attributes(reader, ctx, profile_attr);
++    }
++    else if (!wcscmp(name, L"streamconfig"))
++    {
++        struct wm_profile_stream *stream;
++
++        *child_out = CTX_STREAMCONFIG;
++        if (FAILED(hr = wm_profile_stream_create(&stream)))
++            return hr;
++        ctx->cur_stream = stream;
++        hr = wm_walk_attributes(reader, ctx, streamconfig_attr);
++    }
++    else if (!wcscmp(name, L"wmmediatype"))
++    {
++        *child_out = CTX_WMMEDIATYPE;
++        hr = wm_walk_attributes(reader, ctx, wmmediatype_attr);
++    }
++    else if (!wcscmp(name, L"waveformatex"))
++    {
++        *child_out = CTX_OTHER;
++        hr = handle_waveformatex_element(reader, ctx);
++    }
++    else if (!wcscmp(name, L"videoinfoheader"))
++    {
++        *child_out = CTX_VIDEOINFOHEADER;
++        hr = handle_videoinfoheader_start(reader, ctx);
++    }
++    else if (!wcscmp(name, L"rcsource"))
++    {
++        *child_out = CTX_OTHER;
++        hr = handle_rcsource_element(reader, ctx, &ctx->rc_source);
++    }
++    else if (!wcscmp(name, L"rctarget"))
++    {
++        *child_out = CTX_OTHER;
++        hr = handle_rcsource_element(reader, ctx, &ctx->rc_target);
++    }
++    else if (!wcscmp(name, L"bitmapinfoheader"))
++    {
++        *child_out = CTX_OTHER;
++        hr = handle_bitmapinfoheader_element(reader, &ctx->bmih);
++    }
++    else
++    {
++        /* videomediaprops, dataunitextension, streamprioritization, stream, and any
++         * unrecognized element: no data needed, just keep the context stack balanced. */
++        *child_out = CTX_OTHER;
++    }
++
++    (void)parent;
++    return hr;
++}
++
++static HRESULT handle_element_end(struct parse_ctx *ctx, enum profile_ctx closing)
++{
++    if (closing == CTX_STREAMCONFIG)
++    {
++        struct wm_profile_stream *stream = ctx->cur_stream;
++        HRESULT hr;
++
++        ctx->cur_stream = NULL;
++        if (!stream)
++            return S_OK;
++        if (FAILED(hr = wm_profile_add_stream(ctx->profile, stream)))
++        {
++            wm_profile_stream_destroy(stream);
++            return hr;
++        }
++    }
++    else if (closing == CTX_VIDEOINFOHEADER)
++    {
++        return handle_videoinfoheader_end(ctx);
++    }
++
++    return S_OK;
++}
++
++static HRESULT parse_profile_xml(IXmlReader *reader, struct parse_ctx *ctx)
++{
++    XmlNodeType type;
++    HRESULT hr;
++
++    ctx->stack[0] = CTX_ROOT;
++    ctx->depth = 0;
++
++    while ((hr = IXmlReader_Read(reader, &type)) == S_OK)
++    {
++        if (type == XmlNodeType_Element)
++        {
++            const WCHAR *name;
++            enum profile_ctx parent = ctx->stack[ctx->depth];
++            enum profile_ctx child = CTX_OTHER;
++            BOOL is_empty = IXmlReader_IsEmptyElement(reader);
++
++            if (FAILED(hr = IXmlReader_GetLocalName(reader, &name, NULL)))
++                return hr;
++
++            if (FAILED(hr = handle_element_start(reader, ctx, parent, name, &child)))
++                return hr;
++
++            if (is_empty)
++            {
++                /* No matching EndElement follows for a self-closing element in this
++                 * reader -- all its work already happened in handle_element_start(). */
++                continue;
++            }
++
++            if (ctx->depth + 1 >= (int)(sizeof(ctx->stack) / sizeof(ctx->stack[0])))
++                return NS_E_INVALID_DATA;
++            ctx->stack[++ctx->depth] = child;
++        }
++        else if (type == XmlNodeType_EndElement)
++        {
++            enum profile_ctx closing = ctx->depth ? ctx->stack[ctx->depth] : CTX_ROOT;
++
++            if (FAILED(hr = handle_element_end(ctx, closing)))
++                return hr;
++
++            if (ctx->depth > 0)
++                ctx->depth--;
++
++            if (closing == CTX_PROFILE)
++                return S_OK;
++        }
++    }
++
++    return FAILED(hr) ? hr : NS_E_INVALID_DATA;
++}
++
++HRESULT wm_profile_create_from_xml(const WCHAR *data, void **out_ptr)
++{
++    IWMProfile **out = (IWMProfile **)out_ptr;
++    struct wm_profile *profile;
++    IXmlReader *reader = NULL;
++    IStream *stream = NULL;
++    HGLOBAL hmem;
++    void *buf;
++    HRESULT hr;
++    struct parse_ctx ctx;
++    size_t byte_len;
++
++    *out = NULL;
++    if (!data)
++        return E_INVALIDARG;
++
++    byte_len = (wcslen(data) + 1) * sizeof(WCHAR);
++    if (!(hmem = GlobalAlloc(0, byte_len)))
++        return E_OUTOFMEMORY;
++    if (!(buf = GlobalLock(hmem)))
++    {
++        GlobalFree(hmem);
++        return E_OUTOFMEMORY;
++    }
++    memcpy(buf, data, byte_len);
++    GlobalUnlock(hmem);
++
++    if (FAILED(hr = CreateStreamOnHGlobal(hmem, TRUE, &stream)))
++    {
++        GlobalFree(hmem);
++        return hr;
++    }
++
++    if (FAILED(hr = CreateXmlReader(&IID_IXmlReader, (void **)&reader, NULL)))
++    {
++        IStream_Release(stream);
++        return hr;
++    }
++
++    if (FAILED(hr = IXmlReader_SetInput(reader, (IUnknown *)stream)))
++        goto done;
++
++    if (!(profile = calloc(1, sizeof(*profile))))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    profile->IWMProfile3_iface.lpVtbl = &profile_vtbl;
++    profile->refcount = 1;
++
++    memset(&ctx, 0, sizeof(ctx));
++    ctx.profile = profile;
++
++    if (FAILED(hr = parse_profile_xml(reader, &ctx)))
++    {
++        if (ctx.cur_stream)
++            wm_profile_stream_destroy(ctx.cur_stream);
++        wm_profile_destroy(profile);
++        goto done;
++    }
++
++    *out = (IWMProfile *)&profile->IWMProfile3_iface;
++    hr = S_OK;
++
++done:
++    if (reader) IXmlReader_Release(reader);
++    IStream_Release(stream);
++    return hr;
++}
+diff --git a/dlls/wmvcore/wmvcore_main.c b/dlls/wmvcore/wmvcore_main.c
+index 3b61fe13c15..6d20e6e22f8 100644
+--- a/dlls/wmvcore/wmvcore_main.c
++++ b/dlls/wmvcore/wmvcore_main.c
+@@ -167,8 +167,8 @@ static HRESULT WINAPI WMProfileManager_LoadProfileByID(IWMProfileManager2 *iface
+ static HRESULT WINAPI WMProfileManager_LoadProfileByData(IWMProfileManager2 *iface, const WCHAR *profile, IWMProfile **ret)
+ {
+     WMProfileManager *This = impl_from_IWMProfileManager2(iface);
+-    FIXME("(%p)->(%s %p)\n", This, debugstr_w(profile), ret);
+-    return E_NOTIMPL;
++    TRACE("(%p)->(%s %p)\n", This, debugstr_w(profile), ret);
++    return wm_profile_create_from_xml(profile, (void **)ret);
+ }
+ 
+ static HRESULT WINAPI WMProfileManager_SaveProfile(IWMProfileManager2 *iface, IWMProfile *profile, WCHAR *profile_str, DWORD *len)
+diff --git a/dlls/wmvcore/wmvcore_private.h b/dlls/wmvcore/wmvcore_private.h
+index a5225d79da9..6fb1ba23433 100644
+--- a/dlls/wmvcore/wmvcore_private.h
++++ b/dlls/wmvcore/wmvcore_private.h
+@@ -28,6 +28,8 @@
+ 
+ HRESULT WINAPI winegstreamer_create_wm_sync_reader(IUnknown *outer, void **out);
+ 
++HRESULT wm_profile_create_from_xml(const WCHAR *data, void **out);
++
+ static inline const char *debugstr_time(LONGLONG time)
+ {
+     ULONGLONG abstime = time >= 0 ? time : -time;
