@@ -62,8 +62,9 @@ were complete `E_NOTIMPL` stubs, even though both are purely cosmetic/UI-hint
 methods on real Windows that never affect whether a save actually succeeds. An
 application that checks `SUCCEEDED()` after either call (reasonable, since real
 Windows never fails them for ordinary arguments) never reaches `Show()` at all —
-the Save dialog silently never appears. Found via Windows Movie Maker 6.0: File
-> Save produced no visible dialog. Raw disassembly of MOVIEMK.dll's internal
+the Save dialog silently never appears. Found via Windows Movie Maker 6.0: 
+
+File Save produced no visible dialog. Raw disassembly of MOVIEMK.dll's internal
 `ComGetSaveFileName` helper showed the exact `SetCollectedProperties(NULL,
 FALSE)` call and its `SUCCEEDED()` gate, matching the live trace byte-for-byte;
 `SetSaveAsItem` was a second, later gate in the same chain. Both are now
