@@ -14,6 +14,7 @@ how to install or apply them.
 | [`plasma-desktop/`](plasma-desktop/) | KDE Plasma Desktop | 3 | Adjusts Kickoff and Folder View behavior and scrolls overflowing Task Manager labels on hover. |
 | [`wine-tkg/`](wine-tkg/) | Wine-tkg | 3 | Adds portal-backed file dialogs and Wine Wayland server-side decorations. |
 | [`kpipewire/`](kpipewire/) | KPipewire | 1 | Fixes a bug where KDE's task thumbnails on the taskbar would not work by raising a buffer. |
+| [`kwin/`](kwin/) | KWin | 1 script | Moves Plasma's on-screen display overlay to bottom-center, just above the panel. |
 
 ## Using the files
 
