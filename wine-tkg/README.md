@@ -74,6 +74,19 @@ winegcc harness against the real `comdlg32.dll` (`E_NOTIMPL` before, `S_OK`
 after) and against the real application: the Save dialog now appears, and a
 saved project is written to disk and registered in the shell's Recent Items.
 
+### `0015-quartz-implement-filter-graph-service-providers.mypatch`
+
+Adds DirectShow's missing `IRegisterServiceProvider` declaration and implements both
+`IRegisterServiceProvider` and `IServiceProvider` on quartz's threaded and no-thread Filter
+Graph Manager objects. A critical-section-protected SID registry owns registered COM objects
+until replacement, explicit `NULL` unregistration, or graph destruction; `QueryService`
+forwards the requested IID to the registered object. Found through Windows Movie Maker 6.0:
+`Pipeline.dll!CreateFilterGraphPriv` requires this interface, and Wine's former
+`E_NOINTERFACE` aborted preview graph construction. Confirmed by a minimal real-COM harness
+(fails against the installed unpatched graph, passes all registration/query/lifetime checks
+against the patch) and against the real application, where timeline playback works and title
+overlays are reachable again.
+
 ## Applying
 
 Use the files as wine-tkg custom patches, retaining their numeric order. They
@@ -86,9 +99,10 @@ git apply /path/to/patches/wine-tkg/0011-winewayland-server-side-decorations.myp
 git apply /path/to/patches/wine-tkg/0012-ntdll-implement-mui-satellite-resource-redirection.mypatch
 git apply /path/to/patches/wine-tkg/0013-wmvcore-implement-loadprofilebydata-profile-xml-par.mypatch
 git apply /path/to/patches/wine-tkg/0014-comdlg32-treat-IFileSaveDialog-cosmetic-property-st.mypatch
+git apply /path/to/patches/wine-tkg/0015-quartz-implement-filter-graph-service-providers.mypatch
 ```
 
 Patch 0007 depends on patch 0006. The server-side decoration patch, the MUI
 resource redirection patch, the wmvcore profile-XML patch, and the
-IFileSaveDialog cosmetic-stub patch are each independent of the rest of the
-series.
+IFileSaveDialog cosmetic-stub patch, and the quartz service-provider patch are each independent
+of the rest of the series.

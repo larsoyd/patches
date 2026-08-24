@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lars Slettan Øydneskleiv <larsoyd@github.com>
+Date: Mon, 24 Aug 2026 12:00:00 +0200
+Subject: [PATCH] quartz: Implement filter graph service providers.
+
+The DirectShow Filter Graph Manager exposes IRegisterServiceProvider so
+graph participants can publish SID-addressed service objects, and
+IServiceProvider so other participants can retrieve them. Wine's filter
+graph had placeholders for both interfaces but did not implement either.
+
+Add the missing IRegisterServiceProvider declaration and implement a
+critical-section-protected service registry on the threaded and no-thread
+filter graph classes. Registered objects are strongly referenced until
+replacement, explicit unregistration, or graph destruction.
+
+This fixes preview graph creation in Windows Movie Maker 6.0, whose
+Pipeline.dll requires the interface and registers IID_IValidateBinding.
+
+Signed-off-by: Lars Slettan Øydneskleiv <larsoyd@github.com>
+---
+ dlls/quartz/filtergraph.c       | 181 +++++++++++++++++++++++++++++++++++++++-
+ dlls/quartz/tests/filtergraph.c | 146 ++++++++++++++++++++++++++++++++
+ include/axextend.idl            |  13 +++
+ 3 files changed, 338 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/quartz/filtergraph.c b/dlls/quartz/filtergraph.c
+index b449ef3c32c..6ebf8c7fb4b 100644
+--- a/dlls/quartz/filtergraph.c
++++ b/dlls/quartz/filtergraph.c
+@@ -28,6 +28,7 @@
+ #include "winuser.h"
+ #include "winreg.h"
+ #include "shlwapi.h"
++#include "servprov.h"
+ #include "dshow.h"
+ #include "wine/debug.h"
+ #include "quartz_private.h"
+@@ -77,6 +78,13 @@ struct filter
+     BOOL sorting;
+ };
+ 
++struct graph_service
++{
++    struct list entry;
++    GUID id;
++    IUnknown *object;
++};
++
+ struct filter_graph
+ {
+     IUnknown IUnknown_inner;
+@@ -98,9 +106,9 @@ struct filter_graph
+     /* IFilterChain */
+     /* IFilterMapper2 */
+     /* IQueueCommand */
+-    /* IRegisterServiceProvider */
++    IRegisterServiceProvider IRegisterServiceProvider_iface;
+     /* IResourceManager */
+-    /* IServiceProvider */
++    IServiceProvider IServiceProvider_iface;
+     IVideoFrameStep IVideoFrameStep_iface;
+ 
+     IUnknown *outer_unk;
+@@ -108,6 +116,7 @@ struct filter_graph
+     IUnknown *punkFilterMapper2;
+ 
+     struct list filters;
++    struct list services;
+     unsigned int name_index;
+ 
+     FILTER_STATE state;
+@@ -400,6 +409,12 @@ static HRESULT WINAPI FilterGraphInner_QueryInterface(IUnknown *iface, REFIID ri
+     } else if (IsEqualGUID(&IID_IObjectWithSite, riid)) {
+         *ppvObj = &This->IObjectWithSite_iface;
+         TRACE("   returning IObjectWithSite interface (%p)\n", *ppvObj);
++    } else if (IsEqualGUID(&IID_IRegisterServiceProvider, riid)) {
++        *ppvObj = &This->IRegisterServiceProvider_iface;
++        TRACE("   returning IRegisterServiceProvider interface (%p)\n", *ppvObj);
++    } else if (IsEqualGUID(&IID_IServiceProvider, riid)) {
++        *ppvObj = &This->IServiceProvider_iface;
++        TRACE("   returning IServiceProvider interface (%p)\n", *ppvObj);
+     } else if (IsEqualGUID(&IID_IFilterMapper, riid)) {
+         TRACE("   requesting IFilterMapper interface from aggregated filtermapper (%p)\n", *ppvObj);
+         return IUnknown_QueryInterface(This->punkFilterMapper2, riid, ppvObj);
+@@ -458,6 +473,15 @@ static ULONG WINAPI FilterGraphInner_Release(IUnknown *iface)
+             IFilterGraph2_RemoveFilter(&This->IFilterGraph2_iface, filter->filter);
+         }
+ 
++        while ((cursor = list_head(&This->services)))
++        {
++            struct graph_service *service = LIST_ENTRY(cursor, struct graph_service, entry);
++
++            list_remove(&service->entry);
++            IUnknown_Release(service->object);
++            free(service);
++        }
++
+         if (This->refClock)
+             IReferenceClock_Release(This->refClock);
+ 
+@@ -2856,6 +2880,156 @@ static const IObjectWithSiteVtbl IObjectWithSite_VTable =
+     ObjectWithSite_GetSite,
+ };
+ 
++static struct filter_graph *impl_from_IRegisterServiceProvider(IRegisterServiceProvider *iface)
++{
++    return CONTAINING_RECORD(iface, struct filter_graph, IRegisterServiceProvider_iface);
++}
++
++static HRESULT WINAPI RegisterServiceProvider_QueryInterface(IRegisterServiceProvider *iface,
++        REFIID iid, void **out)
++{
++    struct filter_graph *graph = impl_from_IRegisterServiceProvider(iface);
++    return IUnknown_QueryInterface(graph->outer_unk, iid, out);
++}
++
++static ULONG WINAPI RegisterServiceProvider_AddRef(IRegisterServiceProvider *iface)
++{
++    struct filter_graph *graph = impl_from_IRegisterServiceProvider(iface);
++    return IUnknown_AddRef(graph->outer_unk);
++}
++
++static ULONG WINAPI RegisterServiceProvider_Release(IRegisterServiceProvider *iface)
++{
++    struct filter_graph *graph = impl_from_IRegisterServiceProvider(iface);
++    return IUnknown_Release(graph->outer_unk);
++}
++
++static HRESULT WINAPI RegisterServiceProvider_RegisterService(IRegisterServiceProvider *iface,
++        REFGUID id, IUnknown *object)
++{
++    struct filter_graph *graph = impl_from_IRegisterServiceProvider(iface);
++    struct graph_service *service, *new_service = NULL;
++    IUnknown *old_object = NULL;
++
++    TRACE("graph %p, id %s, object %p.\n", graph, debugstr_guid(id), object);
++
++    if (object)
++    {
++        if (!(new_service = malloc(sizeof(*new_service))))
++            return E_OUTOFMEMORY;
++
++        new_service->id = *id;
++        new_service->object = object;
++        IUnknown_AddRef(object);
++    }
++
++    EnterCriticalSection(&graph->cs);
++    LIST_FOR_EACH_ENTRY(service, &graph->services, struct graph_service, entry)
++    {
++        if (!IsEqualGUID(&service->id, id))
++            continue;
++
++        if (object)
++        {
++            old_object = service->object;
++            service->object = object;
++        }
++        else
++        {
++            list_remove(&service->entry);
++            old_object = service->object;
++            free(service);
++        }
++        break;
++    }
++
++    if (new_service)
++    {
++        if (old_object)
++            free(new_service);
++        else
++            list_add_tail(&graph->services, &new_service->entry);
++    }
++    LeaveCriticalSection(&graph->cs);
++
++    if (old_object)
++        IUnknown_Release(old_object);
++    return S_OK;
++}
++
++static const IRegisterServiceProviderVtbl RegisterServiceProvider_vtbl =
++{
++    RegisterServiceProvider_QueryInterface,
++    RegisterServiceProvider_AddRef,
++    RegisterServiceProvider_Release,
++    RegisterServiceProvider_RegisterService,
++};
++
++static struct filter_graph *impl_from_IServiceProvider(IServiceProvider *iface)
++{
++    return CONTAINING_RECORD(iface, struct filter_graph, IServiceProvider_iface);
++}
++
++static HRESULT WINAPI ServiceProvider_QueryInterface(IServiceProvider *iface, REFIID iid, void **out)
++{
++    struct filter_graph *graph = impl_from_IServiceProvider(iface);
++    return IUnknown_QueryInterface(graph->outer_unk, iid, out);
++}
++
++static ULONG WINAPI ServiceProvider_AddRef(IServiceProvider *iface)
++{
++    struct filter_graph *graph = impl_from_IServiceProvider(iface);
++    return IUnknown_AddRef(graph->outer_unk);
++}
++
++static ULONG WINAPI ServiceProvider_Release(IServiceProvider *iface)
++{
++    struct filter_graph *graph = impl_from_IServiceProvider(iface);
++    return IUnknown_Release(graph->outer_unk);
++}
++
++static HRESULT WINAPI ServiceProvider_QueryService(IServiceProvider *iface, REFGUID id,
++        REFIID iid, void **out)
++{
++    struct filter_graph *graph = impl_from_IServiceProvider(iface);
++    struct graph_service *service;
++    IUnknown *object = NULL;
++    HRESULT hr;
++
++    TRACE("graph %p, id %s, iid %s, out %p.\n", graph, debugstr_guid(id), debugstr_guid(iid), out);
++
++    if (!out)
++        return E_POINTER;
++    *out = NULL;
++
++    EnterCriticalSection(&graph->cs);
++    LIST_FOR_EACH_ENTRY(service, &graph->services, struct graph_service, entry)
++    {
++        if (IsEqualGUID(&service->id, id))
++        {
++            object = service->object;
++            IUnknown_AddRef(object);
++            break;
++        }
++    }
++    LeaveCriticalSection(&graph->cs);
++
++    if (!object)
++        return E_NOINTERFACE;
++
++    hr = IUnknown_QueryInterface(object, iid, out);
++    IUnknown_Release(object);
++    return hr;
++}
++
++static const IServiceProviderVtbl ServiceProvider_vtbl =
++{
++    ServiceProvider_QueryInterface,
++    ServiceProvider_AddRef,
++    ServiceProvider_Release,
++    ServiceProvider_QueryService,
++};
++
+ static HRESULT GetTargetInterface(struct filter_graph* pGraph, REFIID riid, LPVOID* ppvObj)
+ {
+     struct filter *filter;
+@@ -5714,6 +5888,8 @@ static HRESULT filter_graph_common_create(IUnknown *outer, IUnknown **out, BOOL
+     object->IMediaPosition_iface.lpVtbl = &IMediaPosition_VTable;
+     object->IMediaSeeking_iface.lpVtbl = &IMediaSeeking_VTable;
+     object->IObjectWithSite_iface.lpVtbl = &IObjectWithSite_VTable;
++    object->IRegisterServiceProvider_iface.lpVtbl = &RegisterServiceProvider_vtbl;
++    object->IServiceProvider_iface.lpVtbl = &ServiceProvider_vtbl;
+     object->IUnknown_inner.lpVtbl = &IInner_VTable;
+     object->IVideoFrameStep_iface.lpVtbl = &VideoFrameStep_vtbl;
+     object->IVideoWindow_iface.lpVtbl = &IVideoWindow_VTable;
+@@ -5738,6 +5914,7 @@ static HRESULT filter_graph_common_create(IUnknown *outer, IUnknown **out, BOOL
+     object->media_event_handle = CreateEventW(NULL, TRUE, FALSE, NULL);
+     list_init(&object->media_events);
+     list_init(&object->filters);
++    list_init(&object->services);
+     object->HandleEcClockChanged = TRUE;
+     object->HandleEcComplete = TRUE;
+     object->HandleEcRepaint = TRUE;
+diff --git a/dlls/quartz/tests/filtergraph.c b/dlls/quartz/tests/filtergraph.c
+index dde4da0655c..61fcbf670d1 100644
+--- a/dlls/quartz/tests/filtergraph.c
++++ b/dlls/quartz/tests/filtergraph.c
+@@ -23,6 +23,7 @@
+ #define CONST_VTABLE
+ 
+ #include "dshow.h"
++#include "servprov.h"
+ #include "wine/strmbase.h"
+ #include "wine/test.h"
+ 
+@@ -117,6 +118,8 @@ static void test_interfaces(void)
+     check_interface(graph, &IID_IMediaPosition, TRUE);
+     check_interface(graph, &IID_IMediaSeeking, TRUE);
+     check_interface(graph, &IID_IObjectWithSite, TRUE);
++    check_interface(graph, &IID_IRegisterServiceProvider, TRUE);
++    check_interface(graph, &IID_IServiceProvider, TRUE);
+     check_interface(graph, &IID_IVideoFrameStep, TRUE);
+     check_interface(graph, &IID_IVideoWindow, TRUE);
+     check_interface(graph, &IID_IUnknown, TRUE);
+@@ -127,6 +130,147 @@ static void test_interfaces(void)
+     IFilterGraph2_Release(graph);
+ }
+ 
++struct test_service
++{
++    IUnknown IUnknown_iface;
++    LONG ref;
++    LONG *destroy_count;
++};
++
++static struct test_service *impl_from_test_service_IUnknown(IUnknown *iface)
++{
++    return CONTAINING_RECORD(iface, struct test_service, IUnknown_iface);
++}
++
++static HRESULT WINAPI test_service_QueryInterface(IUnknown *iface, REFIID iid, void **out)
++{
++    if (!out)
++        return E_POINTER;
++
++    *out = NULL;
++    if (!IsEqualGUID(iid, &IID_IUnknown))
++        return E_NOINTERFACE;
++
++    IUnknown_AddRef(iface);
++    *out = iface;
++    return S_OK;
++}
++
++static ULONG WINAPI test_service_AddRef(IUnknown *iface)
++{
++    struct test_service *service = impl_from_test_service_IUnknown(iface);
++    return InterlockedIncrement(&service->ref);
++}
++
++static ULONG WINAPI test_service_Release(IUnknown *iface)
++{
++    struct test_service *service = impl_from_test_service_IUnknown(iface);
++    ULONG ref = InterlockedDecrement(&service->ref);
++
++    if (!ref)
++        InterlockedIncrement(service->destroy_count);
++    return ref;
++}
++
++static const IUnknownVtbl test_service_vtbl =
++{
++    test_service_QueryInterface,
++    test_service_AddRef,
++    test_service_Release,
++};
++
++static void init_test_service(struct test_service *service, LONG *destroy_count)
++{
++    service->IUnknown_iface.lpVtbl = &test_service_vtbl;
++    service->ref = 1;
++    service->destroy_count = destroy_count;
++}
++
++static void test_service_provider(REFCLSID class_id)
++{
++    static const GUID service_id = {0xb278a504, 0x78e7, 0x422a,
++            {0xa8, 0x05, 0xb3, 0xee, 0x54, 0xd9, 0x0b, 0xd9}};
++    IRegisterServiceProvider *registrar;
++    IServiceProvider *provider;
++    struct test_service first, second, final;
++    IUnknown *graph, *service;
++    LONG destroy_count = 0;
++    HRESULT hr;
++    ULONG ref;
++
++    hr = CoCreateInstance(class_id, NULL, CLSCTX_INPROC_SERVER, &IID_IUnknown, (void **)&graph);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    hr = IUnknown_QueryInterface(graph, &IID_IRegisterServiceProvider, (void **)&registrar);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    hr = IUnknown_QueryInterface(graph, &IID_IServiceProvider, (void **)&provider);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    service = (IUnknown *)0xdeadbeef;
++    hr = IServiceProvider_QueryService(provider, &service_id, &IID_IUnknown, (void **)&service);
++    ok(hr == E_NOINTERFACE, "Got hr %#lx.\n", hr);
++    ok(!service, "Got service %p.\n", service);
++
++    hr = IServiceProvider_QueryService(provider, &service_id, &IID_IUnknown, NULL);
++    ok(hr == E_POINTER, "Got hr %#lx.\n", hr);
++
++    init_test_service(&first, &destroy_count);
++    hr = IRegisterServiceProvider_RegisterService(registrar, &service_id, &first.IUnknown_iface);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(first.ref == 2, "Got refcount %ld.\n", first.ref);
++    ref = IUnknown_Release(&first.IUnknown_iface);
++    ok(ref == 1, "Got refcount %ld.\n", ref);
++
++    service = NULL;
++    hr = IServiceProvider_QueryService(provider, &service_id, &IID_IUnknown, (void **)&service);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(service == &first.IUnknown_iface, "Got service %p.\n", service);
++    ref = IUnknown_Release(service);
++    ok(ref == 1, "Got refcount %ld.\n", ref);
++
++    service = (IUnknown *)0xdeadbeef;
++    hr = IServiceProvider_QueryService(provider, &service_id, &testguid, (void **)&service);
++    ok(hr == E_NOINTERFACE, "Got hr %#lx.\n", hr);
++    ok(!service, "Got service %p.\n", service);
++
++    init_test_service(&second, &destroy_count);
++    hr = IRegisterServiceProvider_RegisterService(registrar, &service_id, &second.IUnknown_iface);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(destroy_count == 1, "Got destroy count %ld.\n", destroy_count);
++    ref = IUnknown_Release(&second.IUnknown_iface);
++    ok(ref == 1, "Got refcount %ld.\n", ref);
++
++    service = NULL;
++    hr = IServiceProvider_QueryService(provider, &service_id, &IID_IUnknown, (void **)&service);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(service == &second.IUnknown_iface, "Got service %p.\n", service);
++    IUnknown_Release(service);
++
++    hr = IRegisterServiceProvider_RegisterService(registrar, &service_id, NULL);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ok(destroy_count == 2, "Got destroy count %ld.\n", destroy_count);
++
++    service = (IUnknown *)0xdeadbeef;
++    hr = IServiceProvider_QueryService(provider, &service_id, &IID_IUnknown, (void **)&service);
++    ok(hr == E_NOINTERFACE, "Got hr %#lx.\n", hr);
++    ok(!service, "Got service %p.\n", service);
++
++    hr = IRegisterServiceProvider_RegisterService(registrar, &service_id, NULL);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++
++    init_test_service(&final, &destroy_count);
++    hr = IRegisterServiceProvider_RegisterService(registrar, &service_id, &final.IUnknown_iface);
++    ok(hr == S_OK, "Got hr %#lx.\n", hr);
++    ref = IUnknown_Release(&final.IUnknown_iface);
++    ok(ref == 1, "Got refcount %ld.\n", ref);
++
++    IServiceProvider_Release(provider);
++    IRegisterServiceProvider_Release(registrar);
++    ref = IUnknown_Release(graph);
++    ok(!ref, "Got outstanding refcount %lu.\n", ref);
++    ok(destroy_count == 3, "Got destroy count %ld.\n", destroy_count);
++}
++
+ static void test_basic_video(IFilterGraph2 *graph)
+ {
+     IBasicVideo* pbv;
+@@ -6091,6 +6235,8 @@ START_TEST(filtergraph)
+     CoInitializeEx(NULL, COINIT_MULTITHREADED);
+ 
+     test_interfaces();
++    test_service_provider(&CLSID_FilterGraph);
++    test_service_provider(&CLSID_FilterGraphNoThread);
+     test_render_run(L"test.avi", FALSE, TRUE);
+     test_render_run(L"test.mpg", TRUE, TRUE);
+     test_render_run(L"test.mp3", TRUE, FALSE);
+diff --git a/include/axextend.idl b/include/axextend.idl
+index 155dea5dd8a..70b13b06a30 100644
+--- a/include/axextend.idl
++++ b/include/axextend.idl
+@@ -68,6 +68,7 @@ interface IFileSinkFilter2;
+ interface IFilterMapper;
+ interface IFilterMapper2;
+ interface IGraphBuilder;
++interface IRegisterServiceProvider;
+ interface IKsPropertySet;
+ interface IMediaEventSink;
+ interface IMpeg2Demultiplexer;
+@@ -1048,6 +1049,18 @@ interface IGraphVersion : IUnknown
+     HRESULT QueryVersion(LONG* pVersion);
+ }
+ 
++[
++    object,
++    uuid(7b3a2f01-0751-48dd-b556-004785171c54),
++    pointer_default(unique)
++]
++interface IRegisterServiceProvider : IUnknown
++{
++    HRESULT RegisterService(
++        [in] REFGUID guidService,
++        [in] IUnknown *pUnkObject);
++}
++
+ [
+     object,
+     uuid(56a868ad-0ad4-11ce-b03a-0020af0ba770),
+
+-- 
+2.51.0
+
