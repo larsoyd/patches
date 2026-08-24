@@ -1,0 +1,74 @@
+From: Lars Slettan Øydneskleiv <larsoyd@github.com>
+Date: Mon, 24 Aug 2026 02:00:00 +0200
+Subject: [PATCH] comdlg32: Treat IFileSaveDialog cosmetic property stubs as
+ non-fatal.
+
+IFileSaveDialog::SetCollectedProperties() and IFileSaveDialog::SetSaveAsItem()
+were both complete E_NOTIMPL stubs. Both are cosmetic/UI-hint methods on real
+Windows: SetCollectedProperties only affects what property columns the Vista
+Explorer-style Save dialog's optional properties panel shows, and SetSaveAsItem
+only supplies a preferred initial entry for that same dialog (the dialog's
+actual save target is still driven by SetFileName/SetFolder, which Wine already
+implements). Neither is documented to affect whether the save operation itself
+succeeds.
+
+An application that calls either of these while building an IFileSaveDialog
+and checks SUCCEEDED() before continuing (a completely reasonable assumption
+given real Windows never fails either call for ordinary arguments) never
+reaches IFileDialog::Show() at all under Wine — the save dialog silently never
+appears, with no error surfaced to the user.
+
+Found via Windows Movie Maker 6.0: File > Save produced no visible dialog
+window. Live winedbg tracing plus raw disassembly of MOVIEMK.dll's internal
+ComGetSaveFileName helper (which drives the whole IFileSaveDialog setup
+sequence: SetFileTypes, SetOptions, SetCollectedProperties, SetTitle,
+SetDefaultExtension, SetSaveAsItem, ..., Show) showed each step gated by an
+explicit SUCCEEDED()-style check that jumps straight to a common failure-return
+path on FAILED(hr), with SetCollectedProperties(NULL, FALSE) — the exact
+arguments observed live — being the first of two such checks to trip on Wine's
+E_NOTIMPL stubs; SetSaveAsItem would have been the second, later in the same
+chain, had the first not already aborted it.
+
+This treats both methods the same way IFileDialog2_fnAddPlace (an adjacent,
+already-non-fatal cosmetic stub in the same vtable family) is already treated:
+keep the FIXME so the gap stays visible in traces, but return S_OK instead of
+E_NOTIMPL so callers that reasonably assume Windows-correct behavior aren't
+blocked by a UI feature Wine's dialog (native or XDG-portal-backed) doesn't
+need in order to complete a save.
+
+Confirmed via a minimal winegcc harness driving the real comdlg32.dll
+(CoCreateInstance(CLSID_FileSaveDialog) + the exact SetCollectedProperties/
+SetSaveAsItem argument shapes observed live): both calls return E_NOTIMPL
+before this patch, S_OK after. Confirmed against the real application: File >
+Save now reaches and displays the Save dialog, and a project saved through it
+is written to disk and registered in the shell's Recent Items
+(IPersistFile_fnSaveCompleted fires with the real target path), where
+previously the dialog never appeared at all.
+---
+ dlls/comdlg32/itemdlg.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/comdlg32/itemdlg.c b/dlls/comdlg32/itemdlg.c
+index ed51e3028b0..40618aa30ef 100644
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -4127,7 +4127,7 @@ static HRESULT WINAPI IFileSaveDialog_fnSetSaveAsItem(IFileSaveDialog* iface, IS
+ {
+     FileDialogImpl *This = impl_from_IFileSaveDialog(iface);
+     FIXME("stub - %p (%p)\n", This, psi);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+
+ static HRESULT WINAPI IFileSaveDialog_fnSetCollectedProperties(IFileSaveDialog* iface,
+@@ -4143,7 +4143,7 @@ static HRESULT WINAPI IFileSaveDialog_fnSetCollectedProperties(IFileSaveDialog*
+ {
+     FileDialogImpl *This = impl_from_IFileSaveDialog(iface);
+     FIXME("stub - %p (%p, %d)\n", This, pList, fAppendDefault);
+-    return E_NOTIMPL;
++    return S_OK;
+ }
+
+ static HRESULT WINAPI IFileSaveDialog_fnGetProperties(IFileSaveDialog* iface, IPropertyStore **ppStore)
+--
+2.45.2
